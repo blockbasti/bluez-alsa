@@ -1,6 +1,6 @@
 /*
  * BlueALSA - ofono.c
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *               2018 Thierry Bultel
  *
  * This file is a part of bluez-alsa.
@@ -131,8 +131,10 @@ final:
  * @return On success this function returns 0. Otherwise -1 is returned. */
 static int ofono_release_bt_sco(struct ba_transport *t) {
 
+	pthread_mutex_lock(&t->bt_fd_mtx);
+
 	if (t->bt_fd == -1)
-		return 0;
+		goto final;
 
 	debug("Closing oFono SCO: %d", t->bt_fd);
 
@@ -140,6 +142,8 @@ static int ofono_release_bt_sco(struct ba_transport *t) {
 	close(t->bt_fd);
 	t->bt_fd = -1;
 
+final:
+	pthread_mutex_unlock(&t->bt_fd_mtx);
 	return 0;
 }
 
@@ -395,18 +399,24 @@ static void ofono_agent_new_connection(GDBusMethodInvocation *inv) {
 		goto fail;
 	}
 
+	pthread_mutex_lock(&t->bt_fd_mtx);
+
 	debug("New oFono SCO connection (codec: %#x): %d", codec, fd);
 
 	t->bt_fd = fd;
 	t->mtu_read = t->mtu_write = hci_sco_get_mtu(fd);
 
+	pthread_mutex_unlock(&t->bt_fd_mtx);
+
 	ba_transport_set_codec(t, codec);
+
 	bluealsa_dbus_pcm_update(&t->sco.spk_pcm,
 			BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
+	ba_transport_thread_send_signal(t->sco.spk_pcm.th, BA_TRANSPORT_SIGNAL_PING);
+
 	bluealsa_dbus_pcm_update(&t->sco.mic_pcm,
 			BA_DBUS_PCM_UPDATE_SAMPLING | BA_DBUS_PCM_UPDATE_CODEC);
-
-	ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PING);
+	ba_transport_thread_send_signal(t->sco.mic_pcm.th, BA_TRANSPORT_SIGNAL_PING);
 
 	g_dbus_method_invocation_return_value(inv, NULL);
 	goto final;

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - a2dp.c
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -18,8 +18,8 @@
 
 #include "a2dp-codecs.h"
 #include "bluealsa.h"
+#include "codec-sbc.h"
 #include "hci.h"
-#include "sbc.h"
 #include "shared/defs.h"
 #include "shared/log.h"
 
@@ -465,12 +465,21 @@ static const struct a2dp_codec a2dp_codec_sink_ldac = {
 const struct a2dp_codec *a2dp_codecs[] = {
 #if ENABLE_LDAC
 	&a2dp_codec_source_ldac,
+# if HAVE_LDAC_DECODE
+	&a2dp_codec_sink_ldac,
+# endif
 #endif
 #if ENABLE_APTX_HD
 	&a2dp_codec_source_aptx_hd,
+# if HAVE_APTX_HD_DECODE
+	&a2dp_codec_sink_aptx_hd,
+# endif
 #endif
 #if ENABLE_APTX
 	&a2dp_codec_source_aptx,
+# if HAVE_APTX_DECODE
+	&a2dp_codec_sink_aptx,
+# endif
 #endif
 #if ENABLE_FASTSTREAM
 	&a2dp_codec_source_faststream,
@@ -507,6 +516,52 @@ const struct a2dp_codec *a2dp_codec_lookup(uint16_t codec_id, enum a2dp_dir dir)
 				a2dp_codecs[i]->codec_id == codec_id)
 			return a2dp_codecs[i];
 	return NULL;
+}
+
+/**
+ * Lookup number of channels for given capability value.
+ *
+ * @param codec A2DP codec setup.
+ * @param capability_value A2DP codec channel mode configuration value.
+ * @param backchannel If true, lookup in the back-channel configuration.
+ * @return On success this function returns the number of channels. Otherwise,
+ *   if given capability value is not supported (or invalid), 0 is returned. */
+unsigned int a2dp_codec_lookup_channels(
+		const struct a2dp_codec *codec,
+		uint16_t capability_value,
+		bool backchannel) {
+
+	const size_t slot = backchannel ? 1 : 0;
+	size_t i;
+
+	for (i = 0; i < codec->channels_size[slot]; i++)
+		if (capability_value == codec->channels[slot][i].value)
+			return codec->channels[slot][i].channels;
+
+	return 0;
+}
+
+/**
+ * Lookup sampling frequency for given capability value.
+ *
+ * @param codec A2DP codec setup.
+ * @param capability_value A2DP codec sampling configuration value.
+ * @param backchannel If true, lookup in the back-channel configuration.
+ * @return On success this function returns the sampling frequency. Otherwise,
+ *   if given capability value is not supported (or invalid), 0 is returned. */
+unsigned int a2dp_codec_lookup_frequency(
+		const struct a2dp_codec *codec,
+		uint16_t capability_value,
+		bool backchannel) {
+
+	const size_t slot = backchannel ? 1 : 0;
+	size_t i;
+
+	for (i = 0; i < codec->samplings_size[slot]; i++)
+		if (capability_value == codec->samplings[slot][i].value)
+			return codec->samplings[slot][i].frequency;
+
+	return 0;
 }
 
 /**

@@ -99,8 +99,8 @@ const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type 
 			return "/A2DP/LDAC/Source";
 #endif
 		default:
-			warn("Unsupported A2DP codec: %#x", type.codec);
-			return "/A2DP/Source";
+			error("Unsupported A2DP codec: %#x", type.codec);
+			g_assert_not_reached();
 		}
 	case BA_TRANSPORT_PROFILE_A2DP_SINK:
 		switch (type.codec) {
@@ -131,8 +131,8 @@ const char *g_dbus_transport_type_to_bluez_object_path(struct ba_transport_type 
 			return "/A2DP/LDAC/Sink";
 #endif
 		default:
-			warn("Unsupported A2DP codec: %#x", type.codec);
-			return "/A2DP/Sink";
+			error("Unsupported A2DP codec: %#x", type.codec);
+			g_assert_not_reached();
 		}
 	case BA_TRANSPORT_PROFILE_HFP_HF:
 		return "/HFP/HandsFree";
@@ -573,30 +573,6 @@ const char *aacenc_strerror(AACENC_ERROR err) {
 }
 #endif
 
-#if ENABLE_APTX
-/**
- * Destroy apt-X encoder and free handler.
- *
- * @param enc Initialized encoder handler. */
-void aptxbtenc_destroy_free(APTXENC enc) {
-	if (aptxbtenc_destroy != NULL)
-		aptxbtenc_destroy(enc);
-	free(enc);
-}
-#endif
-
-#if ENABLE_APTX_HD
-/**
- * Destroy apt-X HD encoder and free handler.
- *
- * @param enc Initialized encoder handler. */
-void aptxhdbtenc_destroy_free(APTXENC enc) {
-	if (aptxhdbtenc_destroy != NULL)
-		aptxhdbtenc_destroy(enc);
-	free(enc);
-}
-#endif
-
 #if ENABLE_LDAC
 /**
  * Get string representation of the LDAC error code.
@@ -604,9 +580,17 @@ void aptxhdbtenc_destroy_free(APTXENC enc) {
  * @param err LDAC error code.
  * @return Human-readable string. */
 const char *ldacBT_strerror(int err) {
-	switch (LDACBT_API_ERR(err)) {
+	int code = LDACBT_HANDLE_ERR(err);
+	switch (code != 0 ? code : LDACBT_API_ERR(err)) {
 	case LDACBT_ERR_NONE:
 		return "Success";
+	case LDACBT_ERR_FATAL_HANDLE:
+		return "Invalid handle";
+	case LDACBT_ERR_HANDLE_NOT_INIT:
+		return "Handle not initialized";
+	case LDACBT_ERR_ENC_INIT_ALLOC:
+	case LDACBT_ERR_DEC_INIT_ALLOC:
+		return "Out of memory";
 	case LDACBT_ERR_ASSERT_SAMPLING_FREQ:
 	case LDACBT_ERR_ASSERT_SUP_SAMPLING_FREQ:
 	case LDACBT_ERR_CHECK_SAMPLING_FREQ:
@@ -617,15 +601,35 @@ const char *ldacBT_strerror(int err) {
 	case LDACBT_ERR_ASSERT_FRAME_LENGTH:
 	case LDACBT_ERR_ASSERT_SUP_FRAME_LENGTH:
 	case LDACBT_ERR_ASSERT_FRAME_STATUS:
-		return "Invalid frame status";
+	case LDACBT_ERR_FRAME_LENGTH_OVER:
+	case LDACBT_ERR_FRAME_ALIGN_OVER:
+		return "Invalid frame";
 	case LDACBT_ERR_ASSERT_NSHIFT:
 		return "Invalid N-shift";
 	case LDACBT_ERR_ASSERT_CHANNEL_MODE:
 		return "Invalid channel mode";
-	case LDACBT_ERR_ALTER_EQMID_LIMITED:
-		return "EQMID limited";
-	case LDACBT_ERR_HANDLE_NOT_INIT:
-		return "Invalid handle";
+	case LDACBT_ERR_ENC_ILL_GRADMODE:
+	case LDACBT_ERR_ENC_ILL_GRADPAR_A:
+	case LDACBT_ERR_ENC_ILL_GRADPAR_B:
+	case LDACBT_ERR_ENC_ILL_GRADPAR_C:
+	case LDACBT_ERR_ENC_ILL_GRADPAR_D:
+		return "Invalid gradient parameter";
+	case LDACBT_ERR_ENC_ILL_NBANDS:
+		return "Invalid N-bands";
+	case LDACBT_ERR_PACK_BLOCK_FAILED:
+		return "Block packing error";
+	case LDACBT_ERR_INPUT_BUFFER_SIZE:
+		return "Too small input buffer";
+	case LDACBT_ERR_UNPACK_BLOCK_FAILED:
+	case LDACBT_ERR_UNPACK_BLOCK_ALIGN:
+	case LDACBT_ERR_UNPACK_FRAME_ALIGN:
+		return "Block unpacking error";
+	case LDACBT_ERR_ILL_SYNCWORD:
+		return "Invalid sync-word";
+	case LDACBT_ERR_ILL_SMPL_FORMAT:
+		return "Invalid sample format";
+	case LDACBT_ERR_ILL_PARAM:
+		return "Invalid parameter";
 	case LDACBT_ERR_ILL_EQMID:
 		return "Unsupported EQMID";
 	case LDACBT_ERR_ILL_SAMPLING_FREQ:
@@ -634,8 +638,13 @@ const char *ldacBT_strerror(int err) {
 		return "Unsupported channels";
 	case LDACBT_ERR_ILL_MTU_SIZE:
 		return "Unsupported MTU";
+	case LDACBT_ERR_ALTER_EQMID_LIMITED:
+		return "EQMID limited";
+	case LDACBT_ERR_DEC_CONFIG_UPDATED:
+		return "Configuration updated";
 	default:
-		debug("Unknown error code: %#x", err);
+		debug("Unknown error code: %#x (API: %u, handle: %u, block: %u)",
+				err, LDACBT_API_ERR(err), LDACBT_HANDLE_ERR(err), LDACBT_BLOCK_ERR(err));
 		return "Unknown error";
 	}
 }

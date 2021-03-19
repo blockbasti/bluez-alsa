@@ -93,6 +93,8 @@ struct ba_transport_pcm {
 
 	/* backward reference to transport */
 	struct ba_transport *t;
+	/* associated transport thread */
+	struct ba_transport_thread *th;
 
 	/* PCM stream operation mode */
 	enum ba_transport_pcm_mode mode;
@@ -130,16 +132,39 @@ struct ba_transport_pcm {
 	pthread_mutex_t synced_mtx;
 	pthread_cond_t synced;
 
+	/* PCM access synchronization */
+	pthread_mutex_t dbus_mtx;
+
 	/* exported PCM D-Bus API */
 	char *ba_dbus_path;
 	unsigned int ba_dbus_id;
 
 };
 
+struct ba_transport_thread {
+	/* backward reference to transport */
+	struct ba_transport *t;
+	/* guard thread structure */
+	pthread_mutex_t mutex;
+	/* actual thread ID */
+	pthread_t id;
+	/* notification PIPE */
+	int pipe[2];
+	/* indicates cleanup lock */
+	bool cleanup_lock;
+	/* thread synchronization */
+	pthread_mutex_t ready_mtx;
+	pthread_cond_t ready;
+	bool running;
+};
+
 struct ba_transport {
 
 	/* backward reference to device */
 	struct ba_device *d;
+
+	/* guard modifications of transport type, e.g. codec */
+	pthread_mutex_t type_mtx;
 
 	/* Transport structure covers all transports supported by BlueALSA. However,
 	 * every transport requires specific handling - link acquisition, transport
@@ -150,12 +175,8 @@ struct ba_transport {
 	char *bluez_dbus_owner;
 	char *bluez_dbus_path;
 
-	/* This mutex shall guard modifications of the critical sections in this
-	 * transport structure, e.g. thread creation/termination. */
-	pthread_mutex_t mutex;
-
-	/* IO thread - actual transport layer */
-	pthread_t thread;
+	/* guard modifications of our file descriptor */
+	pthread_mutex_t bt_fd_mtx;
 
 	/* This field stores a file descriptor (socket) associated with the BlueZ
 	 * side of the transport. The role of this socket depends on the transport
@@ -166,10 +187,9 @@ struct ba_transport {
 	size_t mtu_read;
 	size_t mtu_write;
 
-	/* PIPE used to notify thread about changes. If thread is based on loop with
-	 * an event wait syscall (e.g. poll), this file descriptor is used to send a
-	 * control event. */
-	int sig_fd[2];
+	/* threads for audio processing */
+	struct ba_transport_thread thread_enc;
+	struct ba_transport_thread thread_dec;
 
 	union {
 
@@ -217,9 +237,6 @@ struct ba_transport {
 
 	};
 
-	/* indicates cleanup lock */
-	bool cleanup_lock;
-
 	/* callback functions for self-management */
 	int (*acquire)(struct ba_transport *);
 	int (*release)(struct ba_transport *);
@@ -255,9 +272,6 @@ void ba_transport_unref(struct ba_transport *t);
 struct ba_transport_pcm *ba_transport_pcm_ref(struct ba_transport_pcm *pcm);
 void ba_transport_pcm_unref(struct ba_transport_pcm *pcm);
 
-int ba_transport_send_signal(struct ba_transport *t, enum ba_transport_signal sig);
-enum ba_transport_signal ba_transport_recv_signal(struct ba_transport *t);
-
 int ba_transport_select_codec_a2dp(
 		struct ba_transport *t,
 		const struct a2dp_sep *sep);
@@ -270,6 +284,7 @@ void ba_transport_set_codec(
 		uint16_t codec_id);
 
 int ba_transport_start(struct ba_transport *t);
+int ba_transport_stop(struct ba_transport *t);
 
 int ba_transport_set_a2dp_state(
 		struct ba_transport *t,
@@ -295,13 +310,25 @@ int ba_transport_pcm_drop(struct ba_transport_pcm *pcm);
 
 int ba_transport_pcm_release(struct ba_transport_pcm *pcm);
 
-int ba_transport_pthread_create(
-		struct ba_transport *t,
-		void *(*routine)(struct ba_transport *),
+int ba_transport_thread_create(
+		struct ba_transport_thread *th,
+		void *(*routine)(struct ba_transport_thread *),
 		const char *name);
 
-void ba_transport_pthread_cleanup(struct ba_transport *t);
-int ba_transport_pthread_cleanup_lock(struct ba_transport *t);
-int ba_transport_pthread_cleanup_unlock(struct ba_transport *t);
+int ba_transport_thread_ready(
+		struct ba_transport_thread *th);
+
+int ba_transport_thread_send_signal(
+		struct ba_transport_thread *th,
+		enum ba_transport_signal sig);
+enum ba_transport_signal ba_transport_thread_recv_signal(
+		struct ba_transport_thread *th);
+
+void ba_transport_thread_cleanup(struct ba_transport_thread *th);
+int ba_transport_thread_cleanup_lock(struct ba_transport_thread *th);
+int ba_transport_thread_cleanup_unlock(struct ba_transport_thread *th);
+
+#define debug_transport_thread_loop(th, tag) \
+	debug("IO loop: %s: %s: %s", tag, __func__, ba_transport_type_to_string((th)->t->type))
 
 #endif

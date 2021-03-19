@@ -1,6 +1,6 @@
 /*
- * BlueALSA - sbc.h
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * BlueALSA - codec-sbc.h
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -8,8 +8,8 @@
  *
  */
 
-#ifndef BLUEALSA_SBC_H_
-#define BLUEALSA_SBC_H_
+#ifndef BLUEALSA_CODECSBC_H_
+#define BLUEALSA_CODECSBC_H_
 
 #if HAVE_CONFIG_H
 # include <config.h>
@@ -25,6 +25,10 @@
 #define SBC_QUALITY_XQ     3
 
 uint8_t sbc_a2dp_get_bitpool(const a2dp_sbc_t *conf, unsigned int quality);
+
+#if ENABLE_MSBC
+int sbc_reinit_msbc(sbc_t *sbc, unsigned long flags);
+#endif
 
 #if DEBUG
 void sbc_print_internals(const sbc_t *sbc);

@@ -1,5 +1,5 @@
 # BlueALSA - configure.ac
-# Copyright (c) 2016-2020 Arkadiusz Bokowy
+# Copyright (c) 2016-2021 Arkadiusz Bokowy
 
 AC_PREREQ([2.60])
 AC_INIT([BlueALSA],
@@ -15,6 +15,8 @@ AC_USE_SYSTEM_EXTENSIONS
 AC_PROG_CC
 AC_PROG_CC_C99
 AC_PROG_INSTALL
+AC_PROG_LN_S
+AC_PROG_MKDIR_P
 AM_PROG_AR
 AM_PROG_CC_C_O
 LT_INIT
@@ -61,7 +63,7 @@ AC_ARG_WITH([libunwind],
 AM_CONDITIONAL([WITH_LIBUNWIND], [test "x$with_libunwind" = "xyes"])
 AM_COND_IF([WITH_LIBUNWIND], [
 	PKG_CHECK_MODULES([LIBUNWIND], [libunwind >= 1.1])
-	AC_DEFINE([ENABLE_LIBUNWIND], [1], [Define to 1 if libunwind shall be used.])
+	AC_DEFINE([WITH_LIBUNWIND], [1], [Define to 1 if libunwind shall be used.])
 ], [
 	AC_CHECK_HEADERS([execinfo.h])
 ])
@@ -95,28 +97,56 @@ AM_COND_IF([ENABLE_AAC], [
 	AC_DEFINE([ENABLE_AAC], [1], [Define to 1 if AAC is enabled.])
 ])
 
+AC_ARG_WITH([libopenaptx],
+	[AS_HELP_STRING([--with-libopenaptx], [use libopenaptx by pali.rohar for apt-X (HD)])])
+AM_CONDITIONAL([WITH_LIBOPENAPTX], [test "x$with_libopenaptx" = "xyes"])
+
 AC_ARG_ENABLE([aptx],
-	[AS_HELP_STRING([--enable-aptx], [enable apt-X encoding support])])
+	[AS_HELP_STRING([--enable-aptx], [enable apt-X support])])
 AM_CONDITIONAL([ENABLE_APTX], [test "x$enable_aptx" = "xyes"])
 AM_COND_IF([ENABLE_APTX], [
-	PKG_CHECK_MODULES([APTX], [openaptx >= 1.2.0])
+	AM_COND_IF([WITH_LIBOPENAPTX], [
+		PKG_CHECK_MODULES([APTX], [libopenaptx >= 0.2.0])
+		AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
+		AC_DEFINE([WITH_LIBOPENAPTX], [1], [Define to 1 if libopenaptx shall be used.])
+	], [
+		PKG_CHECK_MODULES([APTX], [openaptx >= 1.2.0])
+		if test "$($PKG_CONFIG --variable=aptxdecoder openaptx)" = "true"; then
+			AC_DEFINE([HAVE_APTX_DECODE], [1], [Define to 1 if you have apt-X decode library.])
+		fi
+	])
 	AC_DEFINE([ENABLE_APTX], [1], [Define to 1 if apt-X is enabled.])
 ])
 
 AC_ARG_ENABLE([aptx_hd],
-	[AS_HELP_STRING([--enable-aptx-hd], [enable apt-X HD encoding support])])
+	[AS_HELP_STRING([--enable-aptx-hd], [enable apt-X HD support])])
 AM_CONDITIONAL([ENABLE_APTX_HD], [test "x$enable_aptx_hd" = "xyes"])
 AM_COND_IF([ENABLE_APTX_HD], [
-	PKG_CHECK_MODULES([APTX_HD], [openaptxhd >= 1.2.0])
+	AM_COND_IF([WITH_LIBOPENAPTX], [
+		PKG_CHECK_MODULES([APTX_HD], [libopenaptx >= 0.2.0])
+		AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
+		AC_DEFINE([WITH_LIBOPENAPTX], [1], [Define to 1 if libopenaptx shall be used.])
+	], [
+		PKG_CHECK_MODULES([APTX_HD], [openaptxhd >= 1.2.0])
+		if test "$($PKG_CONFIG --variable=aptxdecoder openaptxhd)" = "true"; then
+			AC_DEFINE([HAVE_APTX_HD_DECODE], [1], [Define to 1 if you have apt-X HD decode library.])
+		fi
+	])
 	AC_DEFINE([ENABLE_APTX_HD], [1], [Define to 1 if apt-X HD is enabled.])
 ])
 
+# OR-ed conditional which can be used in the Makefile.am
+AM_CONDITIONAL([ENABLE_APTX_OR_APTX_HD], [
+	test "x$enable_aptx" = "xyes" -o "x$enable_aptx_hd" = "xyes"])
+
 AC_ARG_ENABLE([ldac],
-	[AS_HELP_STRING([--enable-ldac], [enable LDAC encoding support])])
+	[AS_HELP_STRING([--enable-ldac], [enable LDAC support])])
 AM_CONDITIONAL([ENABLE_LDAC], [test "x$enable_ldac" = "xyes"])
 AM_COND_IF([ENABLE_LDAC], [
-	PKG_CHECK_MODULES([LDAC], [ldacBT-enc >= 2.0.0])
-	PKG_CHECK_MODULES([LDAC_ABR], [ldacBT-abr >= 2.0.0])
+	PKG_CHECK_MODULES([LDAC_ABR], [ldacBT-abr >= 1.0.0])
+	PKG_CHECK_MODULES([LDAC_DEC], [ldacBT-dec >= 2.0.0],
+		AC_DEFINE([HAVE_LDAC_DECODE], [1], [Define to 1 if you have LDAC decode module.]), [:])
+	PKG_CHECK_MODULES([LDAC_ENC], [ldacBT-enc >= 2.0.0])
 	AC_DEFINE([ENABLE_LDAC], [1], [Define to 1 if LDAC is enabled.])
 ])
 
@@ -171,6 +201,10 @@ AC_ARG_ENABLE([aplay],
 	[AS_HELP_STRING([--disable-aplay], [disable building of bluealsa-aplay tool])])
 AM_CONDITIONAL([ENABLE_APLAY], [test "x$enable_aplay" != "xno"])
 
+AC_ARG_ENABLE([cli],
+	[AS_HELP_STRING([--enable-cli], [enable building of bluealsa-cli tool])])
+AM_CONDITIONAL([ENABLE_CLI], [test "x$enable_cli" = "xyes"])
+
 AC_ARG_ENABLE([rfcomm],
 	[AS_HELP_STRING([--enable-rfcomm], [enable building of bluealsa-rfcomm tool])])
 AM_CONDITIONAL([ENABLE_RFCOMM], [test "x$enable_rfcomm" = "xyes"])
@@ -194,6 +228,17 @@ AM_COND_IF([ENABLE_MANPAGES], [
 	AC_PATH_PROGS([RST2MAN], [rst2man rst2man.py])
 	AS_IF([test "x$RST2MAN" = "x"], [AC_MSG_ERROR([[--enable-manpages requires rst2man]])])
 ])
+
+AC_ARG_WITH([bash-completion],
+	AS_HELP_STRING([--with-bash-completion@<:@=DIR@:>@], [install bash completion
+		script in DIR (or the bash completions default directory if not specified)]))
+AM_CONDITIONAL([WITH_BASH_COMPLETION], [
+	test "x$with_bash_completion" != "x" -a "x$with_bash_completion" != "xno"])
+AS_IF([test "x$with_bash_completion" = "xyes"], [
+	PKG_CHECK_MODULES([BASH_COMPLETION], [bash-completion >= 2.0],
+		[bashcompdir=$($PKG_CONFIG --variable=completionsdir bash-completion)],
+		[bashcompdir="$datadir/bash-completion/completions"])
+	], [bashcompdir="$with_bash_completion"])
 
 AC_ARG_ENABLE([test],
 	[AS_HELP_STRING([--enable-test], [enable unit test])])
@@ -242,14 +287,17 @@ AC_DEFINE_UNQUOTED([ALSA_PLUGIN_DIR], "$alsaplugindir", [Directory containing AL
 AC_SUBST([DBUS_CONF_DIR], [$dbusconfdir])
 AC_SUBST([ALSA_CONF_DIR], [$alsaconfdir])
 AC_SUBST([ALSA_PLUGIN_DIR], [$alsaplugindir])
+AC_SUBST([BASH_COMPLETION_DIR], [$bashcompdir])
 
 AC_CONFIG_FILES([
 	Makefile
 	doc/Makefile
+	misc/Makefile
 	src/Makefile
 	src/asound/Makefile
 	utils/Makefile
 	utils/aplay/Makefile
+	utils/cli/Makefile
 	utils/rfcomm/Makefile
 	test/Makefile])
 AC_OUTPUT

@@ -1,6 +1,6 @@
 /*
  * BlueALSA - a2dp-audio.c
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -32,9 +32,6 @@
 # define AACENCODER_LIB_VERSION LIB_VERSION( \
 		AACENCODER_LIB_VL0, AACENCODER_LIB_VL1, AACENCODER_LIB_VL2)
 #endif
-#if ENABLE_APTX || ENABLE_APTX_HD
-# include <openaptx.h>
-#endif
 #if ENABLE_MP3LAME
 # include <lame/lame.h>
 #endif
@@ -51,7 +48,10 @@
 #include "a2dp-rtp.h"
 #include "audio.h"
 #include "bluealsa.h"
-#include "sbc.h"
+#if ENABLE_APTX || ENABLE_APTX_HD
+# include "codec-aptx.h"
+#endif
+#include "codec-sbc.h"
 #include "utils.h"
 #include "shared/defs.h"
 #include "shared/ffb.h"
@@ -61,12 +61,15 @@
 /**
  * Common IO thread data. */
 struct io_thread_data {
+	struct ba_transport_thread *th;
 	/* keep-alive and sync timeout */
 	int timeout;
 	/* transfer bit rate synchronization */
 	struct asrsync asrs;
 	/* history of BT socket COUTQ bytes */
 	struct { int v[16]; size_t i; } coutq;
+	/* local counter for RTP sequence number */
+	uint16_t rtp_seq_number;
 	/* determine whether transport is locked */
 	bool t_locked;
 	/* determine whether audio is paused */
@@ -225,46 +228,6 @@ final:
 }
 
 /**
- * Write data to the BT SEQPACKET socket.
- *
- * Note:
- * This function temporally re-enables thread cancellation! */
-static ssize_t io_thread_write_bt(int fd, const uint8_t *buffer,
-		size_t len, int *coutq, int coutq_init) {
-
-	struct pollfd pfd = { fd, POLLOUT, 0 };
-	int oldstate;
-	ssize_t ret;
-
-	/* BT socket is opened in the non-blocking mode. However, this function
-	 * forcefully operates in a blocking mode - it uses poll() when writing
-	 * to the BT socket would block. Hence, it is required to provide a way
-	 * of escaping from the poll() when the IO thread termination request
-	 * has been made by re-enabling thread cancellation. */
-	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
-
-	if (ioctl(pfd.fd, TIOCOUTQ, coutq) == -1)
-		warn("Couldn't get BT queued bytes: %s", strerror(errno));
-	else
-		*coutq = abs(coutq_init - *coutq);
-
-retry:
-	if ((ret = write(pfd.fd, buffer, len)) == -1)
-		switch (errno) {
-		case EINTR:
-			goto retry;
-		case EAGAIN:
-			poll(&pfd, 1, -1);
-			/* set coutq to some arbitrary big value */
-			*coutq = 1024 * 16;
-			goto retry;
-		}
-
-	pthread_setcancelstate(oldstate, NULL);
-	return ret;
-}
-
-/**
  * Poll and read PCM signal from the transport PCM FIFO.
  *
  * Note:
@@ -272,9 +235,9 @@ retry:
 static ssize_t a2dp_poll_and_read_pcm(struct ba_transport_pcm *pcm,
 		struct io_thread_data *io, ffb_t *buffer) {
 
-	struct ba_transport *t = pcm->t;
+	struct ba_transport_thread *th = io->th;
 	struct pollfd fds[2] = {
-		{ t->sig_fd[0], POLLIN, 0 },
+		{ th->pipe[0], POLLIN, 0 },
 		{ -1, POLLIN, 0 }};
 
 	/* Allow escaping from the poll() by thread cancellation. */
@@ -290,10 +253,10 @@ repoll:
 	case 0:
 		pthread_cond_signal(&pcm->synced);
 		io->timeout = -1;
-		io->t_locked = !ba_transport_pthread_cleanup_lock(t);
+		io->t_locked = !ba_transport_thread_cleanup_lock(th);
 		if (pcm->fd == -1)
 			return 0;
-		ba_transport_pthread_cleanup_unlock(t);
+		ba_transport_thread_cleanup_unlock(th);
 		io->t_locked = false;
 		goto repoll;
 	case -1:
@@ -304,7 +267,7 @@ repoll:
 
 	if (fds[0].revents & POLLIN) {
 		/* dispatch incoming event */
-		switch (ba_transport_recv_signal(t)) {
+		switch (ba_transport_thread_recv_signal(th)) {
 		case BA_TRANSPORT_SIGNAL_PCM_OPEN:
 		case BA_TRANSPORT_SIGNAL_PCM_RESUME:
 			io->t_paused = false;
@@ -378,15 +341,16 @@ static int a2dp_validate_bt_sink(struct ba_transport *t) {
 }
 
 /**
- * Poll and read BT signal from the SEQPACKET socket.
+ * Poll and read BT data from the SEQPACKET socket.
  *
  * Note:
  * This function temporally re-enables thread cancellation! */
-static ssize_t a2dp_poll_and_read_bt(struct ba_transport *t,
-		struct io_thread_data *io, ffb_t *buffer) {
+static ssize_t a2dp_poll_and_read_bt(struct io_thread_data *io, ffb_t *buffer) {
 
+	struct ba_transport *t = io->th->t;
+	struct ba_transport_thread *th = io->th;
 	struct pollfd fds[2] = {
-		{ t->sig_fd[0], POLLIN, 0 },
+		{ th->pipe[0], POLLIN, 0 },
 		{ -1, POLLIN, 0 }};
 
 	/* Allow escaping from the poll() by thread cancellation. */
@@ -406,7 +370,7 @@ repoll:
 
 	if (fds[0].revents & POLLIN) {
 		/* dispatch incoming event */
-		switch (ba_transport_recv_signal(t)) {
+		switch (ba_transport_thread_recv_signal(th)) {
 		case BA_TRANSPORT_SIGNAL_PCM_OPEN:
 		case BA_TRANSPORT_SIGNAL_PCM_RESUME:
 			io->t_paused = false;
@@ -441,6 +405,55 @@ repoll:
 }
 
 /**
+ * Write data to the BT SEQPACKET socket.
+ *
+ * Note:
+ * This function temporally re-enables thread cancellation! */
+static ssize_t a2dp_write_bt(struct io_thread_data *io, ffb_t *buffer) {
+
+	struct ba_transport *t = io->th->t;
+	struct pollfd pfd = { t->bt_fd, POLLOUT, 0 };
+	int coutq = 0;
+	int oldstate;
+	ssize_t ret;
+
+	/* BT socket is opened in the non-blocking mode. However, this function
+	 * forcefully operates in a blocking mode - it uses poll() when writing
+	 * to the BT socket would block. Hence, it is required to provide a way
+	 * of escaping from the poll() when the IO thread termination request
+	 * has been made by re-enabling thread cancellation. */
+	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
+
+	/* Try to get the number of bytes queued in the socket output buffer. */
+	if (ioctl(pfd.fd, TIOCOUTQ, &coutq) != -1)
+		coutq = abs(t->a2dp.bt_fd_coutq_init - coutq);
+
+retry:
+	if ((ret = write(pfd.fd, buffer->data, ffb_len_out(buffer))) == -1)
+		switch (errno) {
+		case EINTR:
+			goto retry;
+		case EAGAIN:
+			poll(&pfd, 1, -1);
+			/* set coutq to some arbitrary big value */
+			coutq = 1024 * 16;
+			goto retry;
+		case ECONNRESET:
+		case ENOTCONN:
+			break;
+		default:
+			error("BT socket write error: %s", strerror(errno));
+			ret = 0;
+		}
+
+	io->coutq.i = (io->coutq.i + 1) % ARRAYSIZE(io->coutq.v);
+	io->coutq.v[io->coutq.i] = coutq;
+
+	pthread_setcancelstate(oldstate, NULL);
+	return ret;
+}
+
+/**
  * Initialize RTP headers.
  *
  * @param s The memory area where the RTP headers will be initialized.
@@ -467,18 +480,43 @@ static uint8_t *a2dp_init_rtp(void *s, rtp_header_t **hdr,
 	return data + phdr_size;
 }
 
-static void *a2dp_sink_sbc(struct ba_transport *t) {
+/**
+ * Validate RTP header and get payload.
+ *
+ * @param hdr The pointer to data with RTP header to validate.
+ * @param io The IO thread data - used for storing RTP sequence number.
+ * @return On success, this function returns pointer to data just after
+ *   the RTP header - RTP header payload. On failure, NULL is returned. */
+static void *a2dp_validate_rtp(const rtp_header_t *hdr, struct io_thread_data *io) {
+
+#if ENABLE_PAYLOADCHECK
+	if (hdr->paytype < 96) {
+		warn("Unsupported RTP payload type: %u", hdr->paytype);
+		return NULL;
+	}
+#endif
+
+	uint16_t seq_number = be16toh(hdr->seq_number);
+	if (++io->rtp_seq_number != seq_number) {
+		if (io->rtp_seq_number != 0)
+			warn("Missing RTP packet: %u != %u", seq_number, io->rtp_seq_number);
+		io->rtp_seq_number = seq_number;
+	}
+
+	return (void *)&hdr->csrc[hdr->cc];
+}
+
+static void *a2dp_sink_sbc(struct ba_transport_thread *th) {
 
 	/* Cancellation should be possible only in the carefully selected place
 	 * in order to prevent memory leaks and resources not being released. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
-		/* Lock transport during initialization stage. This lock will ensure,
-		 * that no one will modify critical section until thread state can be
-		 * known - initialization has failed or succeeded. */
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
+		.th = th,
+		.rtp_seq_number = -1,
 	};
 
 	if (a2dp_validate_bt_sink(t) != 0)
@@ -506,49 +544,33 @@ static void *a2dp_sink_sbc(struct ba_transport *t) {
 
 	/* Lock transport during thread cancellation. This handler shall be at
 	 * the top of the cleanup stack - lastly pushed. */
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
-	uint16_t seq_number = -1;
 #if DEBUG
 	uint16_t sbc_bitpool = 0;
 #endif
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(t, &io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
 		if (t->a2dp.pcm.fd == -1) {
-			seq_number = -1;
+			io.rtp_seq_number = -1;
 			continue;
 		}
 
-		const rtp_header_t *rtp_header = (rtp_header_t *)bt.data;
-		const rtp_media_header_t *rtp_media_header = (rtp_media_header_t *)&rtp_header->csrc[rtp_header->cc];
+		const rtp_media_header_t *rtp_media_header;
+		if ((rtp_media_header = a2dp_validate_rtp(bt.data, &io)) == NULL)
+			continue;
+
 		const uint8_t *rtp_payload = (uint8_t *)(rtp_media_header + 1);
-		size_t rtp_payload_len = len - (rtp_payload - (uint8_t *)rtp_header);
-
-#if ENABLE_PAYLOADCHECK
-		if (rtp_header->paytype < 96) {
-			warn("Unsupported RTP payload type: %u", rtp_header->paytype);
-			continue;
-		}
-#endif
-
-		uint16_t _seq_number = be16toh(rtp_header->seq_number);
-		if (++seq_number != _seq_number) {
-			if (seq_number != 0)
-				warn("Missing RTP packet: %u != %u", _seq_number, seq_number);
-			seq_number = _seq_number;
-		}
+		size_t rtp_payload_len = len - (rtp_payload - (uint8_t *)bt.data);
 
 		/* decode retrieved SBC frames */
 		size_t frames = rtp_media_header->frame_count;
@@ -582,6 +604,7 @@ static void *a2dp_sink_sbc(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -593,17 +616,15 @@ fail_init:
 	return NULL;
 }
 
-static void *a2dp_source_sbc(struct ba_transport *t) {
+static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
+		.th = th,
 		.timeout = -1,
-		/* Lock transport during initialization stage. This lock will ensure,
-		 * that no one will modify critical section until thread state can be
-		 * known - initialization has failed or succeeded. */
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
 	};
 
 	sbc_t sbc;
@@ -648,7 +669,7 @@ static void *a2dp_source_sbc(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
 	rtp_header_t *rtp_header;
 	rtp_media_header_t *rtp_media_header;
@@ -659,11 +680,8 @@ static void *a2dp_source_sbc(struct ba_transport *t) {
 	uint16_t seq_number = be16toh(rtp_header->seq_number);
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
@@ -711,15 +729,9 @@ static void *a2dp_source_sbc(struct ba_transport *t) {
 		rtp_header->timestamp = htobe32(timestamp);
 		rtp_media_header->frame_count = sbc_frames;
 
-		io.coutq.i = (io.coutq.i + 1) % ARRAYSIZE(io.coutq.v);
-		if (io_thread_write_bt(t->bt_fd, bt.data, ffb_len_out(&bt),
-					&io.coutq.v[io.coutq.i], t->a2dp.bt_fd_coutq_init) == -1) {
-			if (errno == ECONNRESET || errno == ENOTCONN) {
-				/* exit thread upon BT socket disconnection */
-				debug("BT socket disconnected: %d", t->bt_fd);
-				goto fail;
-			}
-			error("BT socket write error: %s", strerror(errno));
+		if (a2dp_write_bt(&io, &bt) == -1) {
+			debug("BT socket disconnected: %d", t->bt_fd);
+			goto fail;
 		}
 
 		/* keep data transfer at a constant bit rate, also
@@ -739,6 +751,7 @@ static void *a2dp_source_sbc(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -751,13 +764,15 @@ fail_init:
 }
 
 #if ENABLE_MP3LAME || ENABLE_MPG123
-static void *a2dp_sink_mpeg(struct ba_transport *t) {
+static void *a2dp_sink_mpeg(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
+		.th = th,
+		.rtp_seq_number = -1,
 	};
 
 	if (a2dp_validate_bt_sink(t) != 0)
@@ -814,45 +829,29 @@ static void *a2dp_sink_mpeg(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
-	uint16_t seq_number = -1;
-
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(t, &io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
 		if (t->a2dp.pcm.fd == -1) {
-			seq_number = -1;
+			io.rtp_seq_number = -1;
 			continue;
 		}
 
-		const rtp_header_t *rtp_header = (rtp_header_t *)bt.data;
-		uint8_t *rtp_mpeg = (uint8_t *)&rtp_header->csrc[rtp_header->cc] + sizeof(rtp_mpeg_audio_header_t);
-		size_t rtp_mpeg_len = len - (rtp_mpeg - (uint8_t *)rtp_header);
-
-#if ENABLE_PAYLOADCHECK
-		if (rtp_header->paytype < 96) {
-			warn("Unsupported RTP payload type: %u", rtp_header->paytype);
+		const rtp_mpeg_audio_header_t *rtp_mpeg_header;
+		if ((rtp_mpeg_header = a2dp_validate_rtp(bt.data, &io)) == NULL)
 			continue;
-		}
-#endif
 
-		uint16_t _seq_number = be16toh(rtp_header->seq_number);
-		if (++seq_number != _seq_number) {
-			if (seq_number != 0)
-				warn("Missing RTP packet: %u != %u", _seq_number, seq_number);
-			seq_number = _seq_number;
-		}
+		uint8_t *rtp_mpeg = (uint8_t *)(rtp_mpeg_header + 1);
+		size_t rtp_mpeg_len = len - (rtp_mpeg - (uint8_t *)bt.data);
 
 #if ENABLE_MPG123
 
@@ -918,6 +917,7 @@ decode:
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -934,14 +934,15 @@ fail_init:
 #endif
 
 #if ENABLE_MP3LAME
-static void *a2dp_source_mp3(struct ba_transport *t) {
+static void *a2dp_source_mp3(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
+		.th = th,
 		.timeout = -1,
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
 	};
 
 	lame_t handle;
@@ -1041,7 +1042,7 @@ static void *a2dp_source_mp3(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
 	rtp_header_t *rtp_header;
 	rtp_mpeg_audio_header_t *rtp_mpeg_audio_header;
@@ -1052,11 +1053,8 @@ static void *a2dp_source_mp3(struct ba_transport *t) {
 	uint16_t seq_number = be16toh(rtp_header->seq_number);
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
@@ -1095,17 +1093,14 @@ static void *a2dp_source_mp3(struct ba_transport *t) {
 				rtp_header->seq_number = htobe16(++seq_number);
 				rtp_mpeg_audio_header->offset = payload_len_total - payload_len;
 
-				io.coutq.i = (io.coutq.i + 1) % ARRAYSIZE(io.coutq.v);
-				if ((ret = io_thread_write_bt(t->bt_fd, bt.data, RTP_HEADER_LEN +
-								sizeof(*rtp_mpeg_audio_header) + len, &io.coutq.v[io.coutq.i],
-								t->a2dp.bt_fd_coutq_init)) == -1) {
-					if (errno == ECONNRESET || errno == ENOTCONN) {
-						/* exit thread upon BT socket disconnection */
-						debug("BT socket disconnected: %d", t->bt_fd);
-						goto fail;
-					}
-					error("BT socket write error: %s", strerror(errno));
-					break;
+				ffb_rewind(&bt);
+				ffb_seek(&bt, RTP_HEADER_LEN + sizeof(*rtp_mpeg_audio_header) + len);
+
+				if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
+					if (ret == 0)
+						break;
+					debug("BT socket disconnected: %d", t->bt_fd);
+					goto fail;
 				}
 
 				/* account written payload only */
@@ -1140,6 +1135,7 @@ static void *a2dp_source_mp3(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -1154,13 +1150,15 @@ fail_init:
 #endif
 
 #if ENABLE_AAC
-static void *a2dp_sink_aac(struct ba_transport *t) {
+static void *a2dp_sink_aac(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
+		.th = th,
+		.rtp_seq_number = -1,
 	};
 
 	if (a2dp_validate_bt_sink(t) != 0)
@@ -1207,39 +1205,31 @@ static void *a2dp_sink_aac(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
-	uint16_t seq_number = -1;
 	int markbit_quirk = -3;
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(t, &io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
 		if (t->a2dp.pcm.fd == -1) {
-			seq_number = -1;
+			io.rtp_seq_number = -1;
 			continue;
 		}
+
+		const uint8_t *rtp_latm;
+		if ((rtp_latm = a2dp_validate_rtp(bt.data, &io)) == NULL)
+			continue;
 
 		const rtp_header_t *rtp_header = (rtp_header_t *)bt.data;
-		uint8_t *rtp_latm = (uint8_t *)&rtp_header->csrc[rtp_header->cc];
-		size_t rtp_latm_len = len - (rtp_latm - (uint8_t *)rtp_header);
-
-#if ENABLE_PAYLOADCHECK
-		if (rtp_header->paytype < 96) {
-			warn("Unsupported RTP payload type: %u", rtp_header->paytype);
-			continue;
-		}
-#endif
+		size_t rtp_latm_len = len - (rtp_latm - (uint8_t *)bt.data);
 
 		/* If in the first N packets mark bit is not set, it might mean, that
 		 * the mark bit will not be set at all. In such a case, activate mark
@@ -1253,13 +1243,6 @@ static void *a2dp_sink_aac(struct ba_transport *t) {
 			}
 		}
 
-		uint16_t _seq_number = be16toh(rtp_header->seq_number);
-		if (++seq_number != _seq_number) {
-			if (seq_number != 0)
-				warn("Missing RTP packet: %u != %u", _seq_number, seq_number);
-			seq_number = _seq_number;
-		}
-
 		if (ffb_len_in(&latm) < rtp_latm_len) {
 			debug("Resizing LATM buffer: %zd -> %zd", latm.size, latm.size + t->mtu_read);
 			size_t prev_len = ffb_len_out(&latm);
@@ -1271,7 +1254,7 @@ static void *a2dp_sink_aac(struct ba_transport *t) {
 		ffb_seek(&latm, rtp_latm_len);
 
 		if (markbit_quirk != 1 && !rtp_header->markbit) {
-			debug("Fragmented RTP packet [%u]: LATM len: %zd", seq_number, rtp_latm_len);
+			debug("Fragmented RTP packet [%u]: LATM len: %zd", io.rtp_seq_number, rtp_latm_len);
 			continue;
 		}
 
@@ -1297,6 +1280,7 @@ static void *a2dp_sink_aac(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -1312,14 +1296,15 @@ fail_open:
 #endif
 
 #if ENABLE_AAC
-static void *a2dp_source_aac(struct ba_transport *t) {
+static void *a2dp_source_aac(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
+		.th = th,
 		.timeout = -1,
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
 	};
 
 	HANDLE_AACENCODER handle;
@@ -1422,7 +1407,7 @@ static void *a2dp_source_aac(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
 	rtp_header_t *rtp_header;
 
@@ -1455,11 +1440,8 @@ static void *a2dp_source_aac(struct ba_transport *t) {
 	AACENC_InArgs in_args = { 0 };
 	AACENC_OutArgs out_args = { 0 };
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
@@ -1492,16 +1474,14 @@ static void *a2dp_source_aac(struct ba_transport *t) {
 					rtp_header->markbit = payload_len <= payload_len_max;
 					rtp_header->seq_number = htobe16(++seq_number);
 
-					io.coutq.i = (io.coutq.i + 1) % ARRAYSIZE(io.coutq.v);
-					if ((ret = io_thread_write_bt(t->bt_fd, bt.data, RTP_HEADER_LEN + len,
-									&io.coutq.v[io.coutq.i], t->a2dp.bt_fd_coutq_init)) == -1) {
-						if (errno == ECONNRESET || errno == ENOTCONN) {
-							/* exit thread upon BT socket disconnection */
-							debug("BT socket disconnected: %d", t->bt_fd);
-							goto fail;
-						}
-						error("BT socket write error: %s", strerror(errno));
-						break;
+					ffb_rewind(&bt);
+					ffb_seek(&bt, RTP_HEADER_LEN + len);
+
+					if ((ret = a2dp_write_bt(&io, &bt)) <= 0) {
+						if (ret == 0)
+							break;
+						debug("BT socket disconnected: %d", t->bt_fd);
+						goto fail;
 					}
 
 					/* account written payload only */
@@ -1538,6 +1518,7 @@ static void *a2dp_source_aac(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -1551,21 +1532,108 @@ fail_open:
 }
 #endif
 
-#if ENABLE_APTX
-static void *a2dp_source_aptx(struct ba_transport *t) {
+#if ENABLE_APTX && HAVE_APTX_DECODE
+static void *a2dp_sink_aptx(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
-		.timeout = -1,
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
+		.th = th,
 	};
 
-	APTXENC handle = malloc(SizeofAptxbtenc());
-	pthread_cleanup_push(PTHREAD_CLEANUP(aptxbtenc_destroy_free), handle);
+	if (a2dp_validate_bt_sink(t) != 0)
+		goto fail_init;
 
-	if (handle == NULL || aptxbtenc_init(handle, __BYTE_ORDER == __LITTLE_ENDIAN) != 0) {
+	HANDLE_APTX handle;
+	if ((handle = aptxdec_init()) == NULL) {
+		error("Couldn't initialize apt-X decoder: %s", strerror(errno));
+		goto fail_init;
+	}
+
+	ffb_t bt = { 0 };
+	ffb_t pcm = { 0 };
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+	pthread_cleanup_push(PTHREAD_CLEANUP(aptxdec_destroy), handle);
+
+	/* Note, that we are allocating space for one extra output packed, which is
+	 * required by the aptx_decode_sync() function of libopenaptx library. */
+	if (ffb_init_int16_t(&pcm, (t->mtu_read / 4 + 1) * 8) == -1 ||
+			ffb_init_uint8_t(&bt, t->mtu_read) == -1) {
+		error("Couldn't create data buffers: %s", strerror(errno));
+		goto fail_ffb;
+	}
+
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
+
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
+
+		ssize_t len;
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+			if (len == -1)
+				error("BT poll and read error: %s", strerror(errno));
+			goto fail;
+		}
+
+		if (t->a2dp.pcm.fd == -1)
+			continue;
+
+		uint8_t *input = bt.data;
+		size_t input_len = len;
+
+		ffb_rewind(&pcm);
+		while (input_len >= 4) {
+
+			size_t decoded = ffb_len_in(&pcm);
+			ssize_t len;
+
+			if ((len = aptxdec_decode(handle, input, input_len, pcm.tail, &decoded)) <= 0) {
+				error("Apt-X decoding error: %s", strerror(errno));
+				continue;
+			}
+
+			input += len;
+			input_len -= len;
+			ffb_seek(&pcm, decoded);
+
+		}
+
+		if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, ffb_len_out(&pcm)) == -1)
+			error("FIFO write error: %s", strerror(errno));
+
+	}
+
+fail:
+	debug_transport_thread_loop(th, "EXIT");
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_pop(!io.t_locked);
+fail_ffb:
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+fail_init:
+	pthread_cleanup_pop(1);
+	return NULL;
+}
+#endif
+
+#if ENABLE_APTX
+static void *a2dp_source_aptx(struct ba_transport_thread *th) {
+
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+
+	struct ba_transport *t = th->t;
+	struct io_thread_data io = {
+		.th = th,
+		.timeout = -1,
+	};
+
+	HANDLE_APTX handle;
+	if ((handle = aptxenc_init()) == NULL) {
 		error("Couldn't initialize apt-X encoder: %s", strerror(errno));
 		goto fail_init;
 	}
@@ -1574,6 +1642,7 @@ static void *a2dp_source_aptx(struct ba_transport *t) {
 	ffb_t pcm = { 0 };
 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+	pthread_cleanup_push(PTHREAD_CLEANUP(aptxenc_destroy), handle);
 
 	const unsigned int channels = t->a2dp.pcm.channels;
 	const size_t aptx_pcm_samples = 4 * channels;
@@ -1586,13 +1655,10 @@ static void *a2dp_source_aptx(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
@@ -1602,48 +1668,42 @@ static void *a2dp_source_aptx(struct ba_transport *t) {
 		}
 
 		int16_t *input = pcm.data;
-		size_t input_len = samples;
+		size_t input_samples = samples;
 
 		/* encode and transfer obtained data */
-		while (input_len >= aptx_pcm_samples) {
+		while (input_samples >= aptx_pcm_samples) {
 
 			size_t output_len = ffb_len_in(&bt);
-			size_t pcm_frames = 0;
+			size_t pcm_samples = 0;
 
 			/* Generate as many apt-X frames as possible to fill the output buffer
 			 * without overflowing it. The size of the output buffer is based on
 			 * the socket MTU, so such a transfer should be most efficient. */
-			while (input_len >= aptx_pcm_samples && output_len >= aptx_code_len) {
+			while (input_samples >= aptx_pcm_samples && output_len >= aptx_code_len) {
 
-				int32_t pcm_l[4] = { input[0], input[2], input[4], input[6] };
-				int32_t pcm_r[4] = { input[1], input[3], input[5], input[7] };
+				size_t encoded = output_len;
+				ssize_t len;
 
-				if (aptxbtenc_encodestereo(handle, pcm_l, pcm_r, (uint16_t *)bt.tail) != 0) {
+				if ((len = aptxenc_encode(handle, input, input_samples, bt.tail, &encoded)) <= 0) {
 					error("Apt-X encoding error: %s", strerror(errno));
 					break;
 				}
 
-				input += 4 * channels;
-				input_len -= 4 * channels;
-				ffb_seek(&bt, aptx_code_len);
-				output_len -= aptx_code_len;
-				pcm_frames += 4;
+				input += len;
+				input_samples -= len;
+				ffb_seek(&bt, encoded);
+				output_len -= encoded;
+				pcm_samples += len;
 
 			}
 
-			io.coutq.i = (io.coutq.i + 1) % ARRAYSIZE(io.coutq.v);
-			if (io_thread_write_bt(t->bt_fd, bt.data, ffb_len_out(&bt),
-						&io.coutq.v[io.coutq.i], t->a2dp.bt_fd_coutq_init) == -1) {
-				if (errno == ECONNRESET || errno == ENOTCONN) {
-					/* exit thread upon BT socket disconnection */
-					debug("BT socket disconnected: %d", t->bt_fd);
-					goto fail;
-				}
-				error("BT socket write error: %s", strerror(errno));
+			if (a2dp_write_bt(&io, &bt) == -1) {
+				debug("BT socket disconnected: %d", t->bt_fd);
+				goto fail;
 			}
 
 			/* keep data transfer at a constant bit rate */
-			asrsync_sync(&io.asrs, pcm_frames);
+			asrsync_sync(&io.asrs, pcm_samples / channels);
 
 			/* update busy delay (encoding overhead) */
 			t->a2dp.pcm.delay = asrsync_get_busy_usec(&io.asrs) / 100;
@@ -1657,38 +1717,132 @@ static void *a2dp_source_aptx(struct ba_transport *t) {
 		 * have to append new data to the existing one. Since we do not use
 		 * ring buffer, we will simply move unprocessed data to the front
 		 * of our linear buffer. */
-		ffb_shift(&pcm, samples - input_len);
+		ffb_shift(&pcm, samples - input_samples);
 
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
 	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
 fail_init:
 	pthread_cleanup_pop(1);
+	return NULL;
+}
+#endif
+
+#if ENABLE_APTX_HD && HAVE_APTX_HD_DECODE
+static void *a2dp_sink_aptx_hd(struct ba_transport_thread *th) {
+
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+
+	struct ba_transport *t = th->t;
+	struct io_thread_data io = {
+		.th = th,
+		.rtp_seq_number = -1,
+	};
+
+	if (a2dp_validate_bt_sink(t) != 0)
+		goto fail_init;
+
+	HANDLE_APTX handle;
+	if ((handle = aptxhddec_init()) == NULL) {
+		error("Couldn't initialize apt-X HD decoder: %s", strerror(errno));
+		goto fail_init;
+	}
+
+	ffb_t bt = { 0 };
+	ffb_t pcm = { 0 };
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+	pthread_cleanup_push(PTHREAD_CLEANUP(aptxhddec_destroy), handle);
+
+	/* Note, that we are allocating space for one extra output packed, which is
+	 * required by the aptx_decode_sync() function of libopenaptx library. */
+	if (ffb_init_int32_t(&pcm, (t->mtu_read / 6 + 1) * 8) == -1 ||
+			ffb_init_uint8_t(&bt, t->mtu_read) == -1) {
+		error("Couldn't create data buffers: %s", strerror(errno));
+		goto fail_ffb;
+	}
+
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
+
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
+
+		ssize_t len;
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+			if (len == -1)
+				error("BT poll and read error: %s", strerror(errno));
+			goto fail;
+		}
+
+		if (t->a2dp.pcm.fd == -1) {
+			io.rtp_seq_number = -1;
+			continue;
+		}
+
+		const uint8_t *rtp_payload;
+		if ((rtp_payload = a2dp_validate_rtp(bt.data, &io)) == NULL)
+			continue;
+
+		size_t rtp_payload_len = len - (rtp_payload - (uint8_t *)bt.data);
+
+		ffb_rewind(&pcm);
+		while (rtp_payload_len >= 6) {
+
+			size_t decoded = ffb_len_in(&pcm);
+			ssize_t len;
+
+			if ((len = aptxhddec_decode(handle, rtp_payload, rtp_payload_len, pcm.tail, &decoded)) <= 0) {
+				error("Apt-X decoding error: %s", strerror(errno));
+				continue;
+			}
+
+			rtp_payload += len;
+			rtp_payload_len -= len;
+			ffb_seek(&pcm, decoded);
+
+		}
+
+		if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, ffb_len_out(&pcm)) == -1)
+			error("FIFO write error: %s", strerror(errno));
+
+	}
+
+fail:
+	debug_transport_thread_loop(th, "EXIT");
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_pop(!io.t_locked);
+fail_ffb:
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+fail_init:
 	pthread_cleanup_pop(1);
 	return NULL;
 }
 #endif
 
 #if ENABLE_APTX_HD
-static void *a2dp_source_aptx_hd(struct ba_transport *t) {
+static void *a2dp_source_aptx_hd(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
+		.th = th,
 		.timeout = -1,
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
 	};
 
-	APTXENC handle = malloc(SizeofAptxhdbtenc());
-	pthread_cleanup_push(PTHREAD_CLEANUP(aptxhdbtenc_destroy_free), handle);
-
-	if (handle == NULL || aptxhdbtenc_init(handle, false) != 0) {
+	HANDLE_APTX handle;
+	if ((handle = aptxhdenc_init()) == NULL) {
 		error("Couldn't initialize apt-X HD encoder: %s", strerror(errno));
 		goto fail_init;
 	}
@@ -1697,6 +1851,7 @@ static void *a2dp_source_aptx_hd(struct ba_transport *t) {
 	ffb_t pcm = { 0 };
 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+	pthread_cleanup_push(PTHREAD_CLEANUP(aptxhdenc_destroy), handle);
 
 	const unsigned int channels = t->a2dp.pcm.channels;
 	const unsigned int samplerate = t->a2dp.pcm.sampling;
@@ -1710,7 +1865,7 @@ static void *a2dp_source_aptx_hd(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
 	rtp_header_t *rtp_header;
 
@@ -1719,11 +1874,8 @@ static void *a2dp_source_aptx_hd(struct ba_transport *t) {
 	uint16_t seq_number = be16toh(rtp_header->seq_number);
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
@@ -1733,58 +1885,45 @@ static void *a2dp_source_aptx_hd(struct ba_transport *t) {
 		}
 
 		int32_t *input = pcm.data;
-		size_t input_len = samples;
+		size_t input_samples = samples;
 
 		/* encode and transfer obtained data */
-		while (input_len >= aptx_pcm_samples) {
+		while (input_samples >= aptx_pcm_samples) {
 
 			/* anchor for RTP payload */
 			bt.tail = rtp_payload;
 
 			size_t output_len = ffb_len_in(&bt);
-			size_t pcm_frames = 0;
+			size_t pcm_samples = 0;
 
 			/* Generate as many apt-X frames as possible to fill the output buffer
 			 * without overflowing it. The size of the output buffer is based on
 			 * the socket MTU, so such a transfer should be most efficient. */
-			while (input_len >= aptx_pcm_samples && output_len >= aptx_code_len) {
+			while (input_samples >= aptx_pcm_samples && output_len >= aptx_code_len) {
 
-				int32_t pcm_l[4] = { input[0], input[2], input[4], input[6] };
-				int32_t pcm_r[4] = { input[1], input[3], input[5], input[7] };
-				uint32_t code[2];
+				size_t encoded = output_len;
+				ssize_t len;
 
-				if (aptxhdbtenc_encodestereo(handle, pcm_l, pcm_r, code) != 0) {
+				if ((len = aptxhdenc_encode(handle, input, input_samples, bt.tail, &encoded)) <= 0) {
 					error("Apt-X HD encoding error: %s", strerror(errno));
 					break;
 				}
 
-				((uint8_t *)bt.tail)[0] = code[0] >> 16;
-				((uint8_t *)bt.tail)[1] = code[0] >> 8;
-				((uint8_t *)bt.tail)[2] = code[0];
-				((uint8_t *)bt.tail)[3] = code[1] >> 16;
-				((uint8_t *)bt.tail)[4] = code[1] >> 8;
-				((uint8_t *)bt.tail)[5] = code[1];
-
-				input += 4 * channels;
-				input_len -= 4 * channels;
-				ffb_seek(&bt, aptx_code_len);
-				output_len -= aptx_code_len;
-				pcm_frames += 4;
+				input += len;
+				input_samples -= len;
+				ffb_seek(&bt, encoded);
+				output_len -= encoded;
+				pcm_samples += len;
 
 			}
 
-			io.coutq.i = (io.coutq.i + 1) % ARRAYSIZE(io.coutq.v);
-			if (io_thread_write_bt(t->bt_fd, bt.data, ffb_len_out(&bt),
-						&io.coutq.v[io.coutq.i], t->a2dp.bt_fd_coutq_init) == -1) {
-				if (errno == ECONNRESET || errno == ENOTCONN) {
-					/* exit thread upon BT socket disconnection */
-					debug("BT socket disconnected: %d", t->bt_fd);
-					goto fail;
-				}
-				error("BT socket write error: %s", strerror(errno));
+			if (a2dp_write_bt(&io, &bt) == -1) {
+				debug("BT socket disconnected: %d", t->bt_fd);
+				goto fail;
 			}
 
 			/* keep data transfer at a constant bit rate */
+			unsigned int pcm_frames = pcm_samples / channels;
 			asrsync_sync(&io.asrs, pcm_frames);
 			timestamp += pcm_frames * 10000 / samplerate;
 
@@ -1803,11 +1942,117 @@ static void *a2dp_source_aptx_hd(struct ba_transport *t) {
 		 * have to append new data to the existing one. Since we do not use
 		 * ring buffer, we will simply move unprocessed data to the front
 		 * of our linear buffer. */
-		ffb_shift(&pcm, samples - input_len);
+		ffb_shift(&pcm, samples - input_samples);
 
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_pop(!io.t_locked);
+fail_ffb:
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+	pthread_cleanup_pop(1);
+fail_init:
+	pthread_cleanup_pop(1);
+	return NULL;
+}
+#endif
+
+#if ENABLE_LDAC && HAVE_LDAC_DECODE
+static void *a2dp_sink_ldac(struct ba_transport_thread *th) {
+
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
+
+	struct ba_transport *t = th->t;
+	struct io_thread_data io = {
+		.th = th,
+		.rtp_seq_number = -1,
+	};
+
+	if (a2dp_validate_bt_sink(t) != 0)
+		goto fail_open;
+
+	HANDLE_LDAC_BT handle;
+	if ((handle = ldacBT_get_handle()) == NULL) {
+		error("Couldn't get LDAC handle: %s", strerror(errno));
+		goto fail_open;
+	}
+
+	pthread_cleanup_push(PTHREAD_CLEANUP(ldacBT_free_handle), handle);
+
+	const a2dp_ldac_t *configuration = (a2dp_ldac_t *)t->a2dp.configuration;
+	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(t->a2dp.pcm.format);
+	const unsigned int channels = t->a2dp.pcm.channels;
+	const unsigned int samplerate = t->a2dp.pcm.sampling;
+
+	if (ldacBT_init_handle_decode(handle, configuration->channel_mode, samplerate, 0, 0, 0) == -1) {
+		error("Couldn't initialize LDAC decoder: %s", ldacBT_strerror(ldacBT_get_error_code(handle)));
+		goto fail_init;
+	}
+
+	ffb_t bt = { 0 };
+	ffb_t pcm = { 0 };
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &pcm);
+
+	if (ffb_init_int32_t(&pcm, LDACBT_MAX_LSU * channels) == -1 ||
+			ffb_init_uint8_t(&bt, t->mtu_read) == -1) {
+		error("Couldn't create data buffers: %s", strerror(errno));
+		goto fail_ffb;
+	}
+
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
+
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
+
+		ssize_t len;
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+			if (len == -1)
+				error("BT poll and read error: %s", strerror(errno));
+			goto fail;
+		}
+
+		if (t->a2dp.pcm.fd == -1) {
+			io.rtp_seq_number = -1;
+			continue;
+		}
+
+		const rtp_media_header_t *rtp_media_header;
+		if ((rtp_media_header = a2dp_validate_rtp(bt.data, &io)) == NULL)
+			continue;
+
+		const uint8_t *rtp_payload = (uint8_t *)(rtp_media_header + 1);
+		size_t rtp_payload_len = len - (rtp_payload - (uint8_t *)bt.data);
+
+		size_t frames = rtp_media_header->frame_count;
+		while (frames--) {
+
+			int used;
+			int decoded;
+
+			if (ldacBT_decode(handle, (void *)rtp_payload, pcm.data,
+						LDACBT_SMPL_FMT_S32, rtp_payload_len, &used, &decoded) != 0) {
+				error("LDAC decoding error: %s", ldacBT_strerror(ldacBT_get_error_code(handle)));
+				break;
+			}
+
+			rtp_payload += used;
+			rtp_payload_len -= used;
+
+			const size_t samples = decoded / sample_size;
+			if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
+				error("FIFO write error: %s", strerror(errno));
+
+		}
+
+	}
+
+fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -1815,34 +2060,35 @@ fail_ffb:
 	pthread_cleanup_pop(1);
 fail_init:
 	pthread_cleanup_pop(1);
+fail_open:
 	pthread_cleanup_pop(1);
 	return NULL;
 }
 #endif
 
 #if ENABLE_LDAC
-static void *a2dp_source_ldac(struct ba_transport *t) {
+static void *a2dp_source_ldac(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
+	struct ba_transport *t = th->t;
 	struct io_thread_data io = {
+		.th = th,
 		.timeout = -1,
-		.t_locked = !ba_transport_pthread_cleanup_lock(t),
 	};
 
 	HANDLE_LDAC_BT handle;
-	HANDLE_LDAC_ABR handle_abr;
-
 	if ((handle = ldacBT_get_handle()) == NULL) {
-		error("Couldn't open LDAC encoder: %s", strerror(errno));
+		error("Couldn't get LDAC handle: %s", strerror(errno));
 		goto fail_open_ldac;
 	}
 
 	pthread_cleanup_push(PTHREAD_CLEANUP(ldacBT_free_handle), handle);
 
+	HANDLE_LDAC_ABR handle_abr;
 	if ((handle_abr = ldac_ABR_get_handle()) == NULL) {
-		error("Couldn't open LDAC ABR: %s", strerror(errno));
+		error("Couldn't get LDAC ABR handle: %s", strerror(errno));
 		goto fail_open_ldac_abr;
 	}
 
@@ -1854,8 +2100,8 @@ static void *a2dp_source_ldac(struct ba_transport *t) {
 	const unsigned int samplerate = t->a2dp.pcm.sampling;
 	const size_t ldac_pcm_samples = LDACBT_ENC_LSU * channels;
 
-	if (ldacBT_init_handle_encode(handle, t->mtu_write - RTP_HEADER_LEN - sizeof(rtp_media_header_t),
-				config.ldac_eqmid, configuration->channel_mode, LDACBT_SMPL_FMT_S32, samplerate) == -1) {
+	if (ldacBT_init_handle_encode(handle, t->mtu_write, config.ldac_eqmid,
+				configuration->channel_mode, LDACBT_SMPL_FMT_S32, samplerate) == -1) {
 		error("Couldn't initialize LDAC encoder: %s", ldacBT_strerror(ldacBT_get_error_code(handle)));
 		goto fail_init;
 	}
@@ -1880,23 +2126,20 @@ static void *a2dp_source_ldac(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup_lock), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup_lock), th);
 
 	rtp_header_t *rtp_header;
 	rtp_media_header_t *rtp_media_header;
 
 	/* initialize RTP headers and get anchor for payload */
-	bt.tail = a2dp_init_rtp(bt.data, &rtp_header,
+	uint8_t *rtp_payload = a2dp_init_rtp(bt.data, &rtp_header,
 			(void **)&rtp_media_header, sizeof(*rtp_media_header));
 	uint16_t seq_number = be16toh(rtp_header->seq_number);
 	uint32_t timestamp = be32toh(rtp_header->timestamp);
 	size_t ts_frames = 0;
 
-	ba_transport_pthread_cleanup_unlock(t);
-	io.t_locked = false;
-
-	debug("Starting IO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
 		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
@@ -1911,34 +2154,33 @@ static void *a2dp_source_ldac(struct ba_transport *t) {
 		/* encode and transfer obtained data */
 		while (input_len >= ldac_pcm_samples) {
 
-			int len;
+			/* anchor for RTP payload */
+			bt.tail = rtp_payload;
+
+			int used;
 			int encoded;
 			int frames;
 
-			if (ldacBT_encode(handle, input, &len, bt.tail, &encoded, &frames) != 0) {
+			if (ldacBT_encode(handle, input, &used, bt.tail, &encoded, &frames) != 0) {
 				error("LDAC encoding error: %s", ldacBT_strerror(ldacBT_get_error_code(handle)));
 				break;
 			}
 
 			rtp_media_header->frame_count = frames;
 
-			frames = len / sample_size;
+			frames = used / sample_size;
 			input += frames;
 			input_len -= frames;
+			ffb_seek(&bt, encoded);
 
 			if (encoded &&
-					io_thread_write_bt(t->bt_fd, bt.data, ffb_len_out(&bt) + encoded,
-						&io.coutq.v[0], t->a2dp.bt_fd_coutq_init) == -1) {
-				if (errno == ECONNRESET || errno == ENOTCONN) {
-					/* exit thread upon BT socket disconnection */
-					debug("BT socket disconnected: %d", t->bt_fd);
-					goto fail;
-				}
-				error("BT socket write error: %s", strerror(errno));
+					a2dp_write_bt(&io, &bt) == -1) {
+				debug("BT socket disconnected: %d", t->bt_fd);
+				goto fail;
 			}
 
 			if (config.ldac_abr)
-				ldac_ABR_Proc(handle, handle_abr, io.coutq.v[0] / t->mtu_write, 1);
+				ldac_ABR_Proc(handle, handle_abr, io.coutq.v[io.coutq.i] / t->mtu_write, 1);
 
 			/* keep data transfer at a constant bit rate */
 			asrsync_sync(&io.asrs, frames / channels);
@@ -1965,6 +2207,7 @@ static void *a2dp_source_ldac(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	pthread_cleanup_pop(!io.t_locked);
 fail_ffb:
@@ -1980,14 +2223,16 @@ fail_open_ldac:
 }
 #endif
 
+#if DEBUG
 /**
  * Dump incoming BT data to a file. */
-static void *a2dp_sink_dump(struct ba_transport *t) {
+static void *a2dp_sink_dump(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
-	struct io_thread_data io = { 0 };
+	struct ba_transport *t = th->t;
+	struct io_thread_data io = { .th = th };
 	ffb_t bt = { 0 };
 	FILE *f = NULL;
 	char fname[64];
@@ -2014,9 +2259,10 @@ static void *a2dp_sink_dump(struct ba_transport *t) {
 		goto fail_ffb;
 	}
 
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(t, &io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
@@ -2026,6 +2272,7 @@ static void *a2dp_sink_dump(struct ba_transport *t) {
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 fail_ffb:
 	pthread_cleanup_pop(1);
@@ -2034,55 +2281,71 @@ fail_open:
 	pthread_cleanup_pop(1);
 	return NULL;
 }
+#endif
 
 int a2dp_audio_thread_create(struct ba_transport *t) {
+
+	struct ba_transport_thread *th_enc = &t->thread_enc;
+	struct ba_transport_thread *th_dec = &t->thread_dec;
 
 	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SOURCE)
 		switch (t->type.codec) {
 		case A2DP_CODEC_SBC:
-			return ba_transport_pthread_create(t, a2dp_source_sbc, "ba-a2dp-sbc");
+			return ba_transport_thread_create(th_enc, a2dp_source_sbc, "ba-a2dp-sbc");
 #if ENABLE_MPEG
 		case A2DP_CODEC_MPEG12:
 #if ENABLE_MP3LAME
 			if (((a2dp_mpeg_t *)t->a2dp.configuration)->layer == MPEG_LAYER_MP3)
-				return ba_transport_pthread_create(t, a2dp_source_mp3, "ba-a2dp-mp3");
+				return ba_transport_thread_create(th_enc, a2dp_source_mp3, "ba-a2dp-mp3");
 #endif
 			break;
 #endif
 #if ENABLE_AAC
 		case A2DP_CODEC_MPEG24:
-			return ba_transport_pthread_create(t, a2dp_source_aac, "ba-a2dp-aac");
+			return ba_transport_thread_create(th_enc, a2dp_source_aac, "ba-a2dp-aac");
 #endif
 #if ENABLE_APTX
 		case A2DP_CODEC_VENDOR_APTX:
-			return ba_transport_pthread_create(t, a2dp_source_aptx, "ba-a2dp-aptx");
+			return ba_transport_thread_create(th_enc, a2dp_source_aptx, "ba-a2dp-aptx");
 #endif
 #if ENABLE_APTX_HD
 		case A2DP_CODEC_VENDOR_APTX_HD:
-			return ba_transport_pthread_create(t, a2dp_source_aptx_hd, "ba-a2dp-aptx-hd");
+			return ba_transport_thread_create(th_enc, a2dp_source_aptx_hd, "ba-a2dp-aptx-hd");
 #endif
 #if ENABLE_LDAC
 		case A2DP_CODEC_VENDOR_LDAC:
-			return ba_transport_pthread_create(t, a2dp_source_ldac, "ba-a2dp-ldac");
+			return ba_transport_thread_create(th_enc, a2dp_source_ldac, "ba-a2dp-ldac");
 #endif
 		}
 	else if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SINK)
 		switch (t->type.codec) {
 		case A2DP_CODEC_SBC:
-			return ba_transport_pthread_create(t, a2dp_sink_sbc, "ba-a2dp-sbc");
+			return ba_transport_thread_create(th_dec, a2dp_sink_sbc, "ba-a2dp-sbc");
 #if ENABLE_MPEG
 		case A2DP_CODEC_MPEG12:
 #if ENABLE_MPG123
-			return ba_transport_pthread_create(t, a2dp_sink_mpeg, "ba-a2dp-mpeg");
+			return ba_transport_thread_create(th_dec, a2dp_sink_mpeg, "ba-a2dp-mpeg");
 #elif ENABLE_MP3LAME
 			if (((a2dp_mpeg_t *)t->a2dp.configuration)->layer == MPEG_LAYER_MP3)
-				return ba_transport_pthread_create(t, a2dp_sink_mpeg, "ba-a2dp-mp3");
+				return ba_transport_thread_create(th_dec, a2dp_sink_mpeg, "ba-a2dp-mp3");
 #endif
 			break;
 #endif
 #if ENABLE_AAC
 		case A2DP_CODEC_MPEG24:
-			return ba_transport_pthread_create(t, a2dp_sink_aac, "ba-a2dp-aac");
+			return ba_transport_thread_create(th_dec, a2dp_sink_aac, "ba-a2dp-aac");
+#endif
+#if ENABLE_APTX && HAVE_APTX_DECODE
+		case A2DP_CODEC_VENDOR_APTX:
+			return ba_transport_thread_create(th_dec, a2dp_sink_aptx, "ba-a2dp-aptx");
+#endif
+#if ENABLE_APTX_HD && HAVE_APTX_HD_DECODE
+		case A2DP_CODEC_VENDOR_APTX_HD:
+			return ba_transport_thread_create(th_dec, a2dp_sink_aptx_hd, "ba-a2dp-aptx-hd");
+#endif
+#if ENABLE_LDAC && HAVE_LDAC_DECODE
+		case A2DP_CODEC_VENDOR_LDAC:
+			return ba_transport_thread_create(th_dec, a2dp_sink_ldac, "ba-a2dp-ldac");
 #endif
 		}
 

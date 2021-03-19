@@ -1,5 +1,5 @@
 # BlueALSA - Makefile.am
-# Copyright (c) 2016-2020 Arkadiusz Bokowy
+# Copyright (c) 2016-2021 Arkadiusz Bokowy
 
 bin_PROGRAMS = bluealsa
 SUBDIRS = asound
@@ -24,16 +24,21 @@ bluealsa_SOURCES = \
 	bluealsa-iface.c \
 	bluez.c \
 	bluez-iface.c \
+	codec-sbc.c \
 	dbus.c \
 	hci.c \
-	sbc.c \
 	sco.c \
 	utils.c \
 	main.c
 
+if ENABLE_APTX_OR_APTX_HD
+bluealsa_SOURCES += \
+	codec-aptx.c
+endif
+
 if ENABLE_MSBC
 bluealsa_SOURCES += \
-	msbc.c
+	codec-msbc.c
 endif
 
 if ENABLE_OFONO
@@ -55,7 +60,8 @@ AM_CFLAGS = \
 	@GIO2_CFLAGS@ \
 	@GLIB2_CFLAGS@ \
 	@LDAC_ABR_CFLAGS@ \
-	@LDAC_CFLAGS@ \
+	@LDAC_DEC_CFLAGS@ \
+	@LDAC_ENC_CFLAGS@ \
 	@LIBUNWIND_CFLAGS@ \
 	@MPG123_CFLAGS@ \
 	@SBC_CFLAGS@
@@ -68,7 +74,8 @@ LDADD = \
 	@GIO2_LIBS@ \
 	@GLIB2_LIBS@ \
 	@LDAC_ABR_LIBS@ \
-	@LDAC_LIBS@ \
+	@LDAC_DEC_LIBS@ \
+	@LDAC_ENC_LIBS@ \
 	@LIBUNWIND_LIBS@ \
 	@MP3LAME_LIBS@ \
 	@MPG123_LIBS@ \

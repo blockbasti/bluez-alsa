@@ -219,9 +219,17 @@ static void bluealsa_manager_get_pcms(GDBusMethodInvocation *inv) {
 
 				if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
 
-					ba_variant_populate_pcm(&props, &t->a2dp.pcm);
-					g_variant_builder_add(&pcms, "{oa{sv}}", t->a2dp.pcm.ba_dbus_path, &props);
-					g_variant_builder_clear(&props);
+					if (t->a2dp.pcm.ba_dbus_id != 0) {
+						ba_variant_populate_pcm(&props, &t->a2dp.pcm);
+						g_variant_builder_add(&pcms, "{oa{sv}}", t->a2dp.pcm.ba_dbus_path, &props);
+						g_variant_builder_clear(&props);
+					}
+
+					if (t->a2dp.pcm_bc.ba_dbus_id != 0) {
+						ba_variant_populate_pcm(&props, &t->a2dp.pcm_bc);
+						g_variant_builder_add(&pcms, "{oa{sv}}", t->a2dp.pcm_bc.ba_dbus_path, &props);
+						g_variant_builder_clear(&props);
+					}
 
 				}
 				else if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO) {
@@ -282,7 +290,6 @@ static gboolean bluealsa_pcm_controller(GIOChannel *ch, GIOCondition condition,
 	(void)condition;
 
 	struct ba_transport_pcm *pcm = (struct ba_transport_pcm *)userdata;
-	struct ba_transport *t = pcm->t;
 	char command[32];
 	size_t len;
 
@@ -319,7 +326,7 @@ static gboolean bluealsa_pcm_controller(GIOChannel *ch, GIOCondition condition,
 		return TRUE;
 	case G_IO_STATUS_EOF:
 		ba_transport_pcm_release(pcm);
-		ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
+		ba_transport_thread_send_signal(pcm->th, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
 		/* remove channel from watch */
 		return FALSE;
 	}
@@ -332,10 +339,19 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 	void *userdata = g_dbus_method_invocation_get_user_data(inv);
 	struct ba_transport_pcm *pcm = (struct ba_transport_pcm *)userdata;
 	const bool is_sink = pcm->mode == BA_TRANSPORT_PCM_MODE_SINK;
+	struct ba_transport_thread *th = pcm->th;
 	struct ba_transport *t = pcm->t;
 	int pcm_fds[4] = { -1, -1, -1, -1 };
-	bool locked = false;
 	size_t i;
+
+	/* Prevent two (or more) clients trying to
+	 * open the same PCM at the same time. */
+	pthread_mutex_lock(&pcm->dbus_mtx);
+
+	/* We must ensure that transport release is not in progress before
+	 * accessing transport critical section. Otherwise, we might have
+	 * the IO thread closing it in the middle of the open procedure! */
+	ba_transport_thread_cleanup_lock(th);
 
 	/* preliminary check whether HFP codes is selected */
 	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_SCO &&
@@ -344,12 +360,6 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 				G_DBUS_ERROR_FAILED, "HFP audio codec not selected");
 		goto fail;
 	}
-
-	/* We must ensure that transport release is not in progress before
-	 * accessing transport critical section. Otherwise, we might have
-	 * the IO thread close it in the middle of open procedure! */
-	ba_transport_pthread_cleanup_lock(t);
-	locked = true;
 
 	if (pcm->fd != -1) {
 		g_dbus_method_invocation_return_error(inv, G_DBUS_ERROR,
@@ -396,10 +406,21 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 	g_io_channel_set_encoding(ch, NULL, NULL);
 	g_io_channel_unref(ch);
 
-	/* notify our IO thread that the FIFO is ready */
-	ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PCM_OPEN);
+	/* notify our audio thread that the FIFO is ready */
+	ba_transport_thread_send_signal(th, BA_TRANSPORT_SIGNAL_PCM_OPEN);
 
-	ba_transport_pthread_cleanup_unlock(t);
+	/* For source profiles (A2DP Source and SCO Audio Gateway) wait
+	 * until the underlying IO thread is ready to process audio. */
+	if (t->type.profile & BA_TRANSPORT_PROFILE_A2DP_SOURCE ||
+			t->type.profile & BA_TRANSPORT_PROFILE_MASK_AG) {
+		pthread_mutex_lock(&th->ready_mtx);
+		while (!th->running)
+			pthread_cond_wait(&th->ready, &th->ready_mtx);
+		pthread_mutex_unlock(&th->ready_mtx);
+	}
+
+	ba_transport_thread_cleanup_unlock(th);
+	pthread_mutex_unlock(&pcm->dbus_mtx);
 	ba_transport_pcm_unref(pcm);
 
 	int fds[2] = { pcm_fds[is_sink ? 1 : 0], pcm_fds[3] };
@@ -411,8 +432,8 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 	return;
 
 fail:
-	if (locked)
-		ba_transport_pthread_cleanup_unlock(t);
+	ba_transport_thread_cleanup_unlock(th);
+	pthread_mutex_unlock(&pcm->dbus_mtx);
 	ba_transport_pcm_unref(pcm);
 	/* clean up created file descriptors */
 	for (i = 0; i < ARRAYSIZE(pcm_fds); i++)
@@ -453,7 +474,7 @@ static void bluealsa_pcm_get_codecs(GDBusMethodInvocation *inv) {
 				ba_transport_codecs_hfp_to_string(HFP_CODEC_CVSD), NULL);
 
 #if ENABLE_MSBC
-		if (t->sco.rfcomm->msbc)
+		if (t->sco.rfcomm != NULL && t->sco.rfcomm->msbc)
 			g_variant_builder_add(&codecs, "{sa{sv}}",
 					ba_transport_codecs_hfp_to_string(HFP_CODEC_MSBC), NULL);
 #endif
@@ -498,6 +519,9 @@ static void bluealsa_pcm_select_codec(GDBusMethodInvocation *inv) {
 		g_variant_unref(value);
 		value = NULL;
 	}
+
+	/* synchronize codec selection and e.g. PCM open */
+	pthread_mutex_lock(&pcm->dbus_mtx);
 
 	if (t->type.profile & BA_TRANSPORT_PROFILE_MASK_A2DP) {
 
@@ -570,6 +594,7 @@ fail:
 			G_DBUS_ERROR_FAILED, "%s", errmsg);
 
 final:
+	pthread_mutex_unlock(&pcm->dbus_mtx);
 	ba_transport_pcm_unref(pcm);
 	g_free(a2dp_configuration);
 	g_variant_iter_free(properties);

@@ -9,7 +9,6 @@ TESTS = \
 	test-audio \
 	test-ba \
 	test-io \
-	test-msbc \
 	test-rfcomm \
 	test-utils
 
@@ -22,9 +21,13 @@ check_PROGRAMS = \
 	test-audio \
 	test-ba \
 	test-io \
-	test-msbc \
 	test-rfcomm \
 	test-utils
+
+if ENABLE_MSBC
+TESTS += test-msbc
+check_PROGRAMS += test-msbc
+endif
 
 check_LTLIBRARIES = \
 	aloader.la
@@ -44,7 +47,8 @@ AM_CFLAGS = \
 	@GIO2_CFLAGS@ \
 	@GLIB2_CFLAGS@ \
 	@LDAC_ABR_CFLAGS@ \
-	@LDAC_CFLAGS@ \
+	@LDAC_DEC_CFLAGS@ \
+	@LDAC_ENC_CFLAGS@ \
 	@LIBUNWIND_CFLAGS@ \
 	@MPG123_CFLAGS@ \
 	@SBC_CFLAGS@
@@ -59,7 +63,8 @@ LDADD = \
 	@GIO2_LIBS@ \
 	@GLIB2_LIBS@ \
 	@LDAC_ABR_LIBS@ \
-	@LDAC_LIBS@ \
+	@LDAC_DEC_LIBS@ \
+	@LDAC_ENC_LIBS@ \
 	@LIBUNWIND_LIBS@ \
 	@MP3LAME_LIBS@ \
 	@MPG123_LIBS@ \

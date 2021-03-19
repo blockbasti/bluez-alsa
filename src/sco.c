@@ -1,6 +1,6 @@
 /*
  * BlueALSA - sco.c
- * Copyright (c) 2016-2020 Arkadiusz Bokowy
+ * Copyright (c) 2016-2021 Arkadiusz Bokowy
  *
  * This file is a part of bluez-alsa.
  *
@@ -27,9 +27,9 @@
 #include "a2dp-audio.h"
 #include "ba-device.h"
 #include "bluealsa.h"
+#include "codec-msbc.h"
 #include "hci.h"
 #include "hfp.h"
-#include "msbc.h"
 #include "utils.h"
 #include "shared/defs.h"
 #include "shared/ffb.h"
@@ -131,7 +131,8 @@ static void *sco_dispatcher_thread(struct ba_adapter *a) {
 		t->mtu_read = t->mtu_write = hci_sco_get_mtu(fd);
 		fd = -1;
 
-		ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PING);
+		ba_transport_thread_send_signal(t->sco.spk_pcm.th, BA_TRANSPORT_SIGNAL_PING);
+		ba_transport_thread_send_signal(t->sco.mic_pcm.th, BA_TRANSPORT_SIGNAL_PING);
 
 cleanup:
 		if (d != NULL)
@@ -202,10 +203,10 @@ int sco_setup_connection_dispatcher(struct ba_adapter *a) {
 	return 0;
 }
 
-void *sco_thread(struct ba_transport *t) {
+void *sco_thread(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_pthread_cleanup), t);
+	pthread_cleanup_push(PTHREAD_CLEANUP(ba_transport_thread_cleanup), th);
 
 	/* buffers for transferring data to and from SCO socket */
 	ffb_t bt_in = { 0 };
@@ -214,8 +215,10 @@ void *sco_thread(struct ba_transport *t) {
 	pthread_cleanup_push(PTHREAD_CLEANUP(ffb_free), &bt_out);
 
 #if ENABLE_MSBC
-	struct esco_msbc msbc = { .initialized = false };
-	pthread_cleanup_push(PTHREAD_CLEANUP(msbc_finish), &msbc);
+	struct esco_msbc msbc_enc = { .initialized = false };
+	struct esco_msbc msbc_dec = { .initialized = false };
+	pthread_cleanup_push(PTHREAD_CLEANUP(msbc_finish), &msbc_enc);
+	pthread_cleanup_push(PTHREAD_CLEANUP(msbc_finish), &msbc_dec);
 	bool initialize_msbc = true;
 #endif
 
@@ -227,9 +230,10 @@ void *sco_thread(struct ba_transport *t) {
 	}
 
 	int poll_timeout = -1;
+	struct ba_transport *t = th->t;
 	struct asrsync asrs = { .frames = 0 };
 	struct pollfd pfds[] = {
-		{ t->sig_fd[0], POLLIN, 0 },
+		{ th->pipe[0], POLLIN, 0 },
 		/* SCO socket */
 		{ -1, POLLIN, 0 },
 		{ -1, POLLOUT, 0 },
@@ -238,8 +242,8 @@ void *sco_thread(struct ba_transport *t) {
 		{ -1, POLLOUT, 0 },
 	};
 
-	debug("Starting SCO loop: %s", ba_transport_type_to_string(t->type));
-	for (;;) {
+	debug_transport_thread_loop(th, "START");
+	for (ba_transport_thread_ready(th);;) {
 
 		/* prevent an unexpected change of the codec value */
 		const uint16_t codec = t->type.codec;
@@ -251,7 +255,7 @@ void *sco_thread(struct ba_transport *t) {
 #if ENABLE_MSBC
 		if (initialize_msbc && codec == HFP_CODEC_MSBC) {
 			initialize_msbc = false;
-			if (msbc_init(&msbc) != 0) {
+			if (msbc_init(&msbc_enc) != 0 || msbc_init(&msbc_dec) != 0) {
 				error("Couldn't initialize mSBC codec: %s", strerror(errno));
 				goto fail;
 			}
@@ -272,17 +276,17 @@ void *sco_thread(struct ba_transport *t) {
 			break;
 #if ENABLE_MSBC
 		case HFP_CODEC_MSBC:
-			if (msbc_encode(&msbc) == -1)
+			if (msbc_encode(&msbc_enc) == -1)
 				warn("Couldn't encode mSBC: %s", strerror(errno));
-			if (msbc_decode(&msbc) == -1)
+			if (msbc_decode(&msbc_dec) == -1)
 				warn("Couldn't decode mSBC: %s", strerror(errno));
-			if (ffb_blen_in(&msbc.dec_data) >= t->mtu_read)
+			if (ffb_blen_in(&msbc_dec.data) >= t->mtu_read)
 				pfds[1].fd = t->bt_fd;
-			if (ffb_blen_out(&msbc.enc_data) >= t->mtu_write)
+			if (ffb_blen_out(&msbc_enc.data) >= t->mtu_write)
 				pfds[2].fd = t->bt_fd;
-			if (t->bt_fd != -1 && ffb_blen_in(&msbc.enc_pcm) >= t->mtu_write)
+			if (t->bt_fd != -1 && ffb_blen_in(&msbc_enc.pcm) >= t->mtu_write)
 				pfds[3].fd = t->sco.spk_pcm.fd;
-			if (ffb_blen_out(&msbc.dec_pcm) > 0)
+			if (ffb_blen_out(&msbc_dec.pcm) > 0)
 				pfds[4].fd = t->sco.mic_pcm.fd;
 			/* If SCO is not opened or PCM is not connected,
 			 * mark mSBC encoder/decoder for reinitialization. */
@@ -311,7 +315,7 @@ void *sco_thread(struct ba_transport *t) {
 
 		if (pfds[0].revents & POLLIN) {
 			/* dispatch incoming event */
-			switch (ba_transport_recv_signal(t)) {
+			switch (ba_transport_thread_recv_signal(th)) {
 			case BA_TRANSPORT_SIGNAL_PING:
 				continue;
 			case BA_TRANSPORT_SIGNAL_PCM_OPEN:
@@ -366,8 +370,8 @@ void *sco_thread(struct ba_transport *t) {
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				buffer = msbc.dec_data.tail;
-				buffer_len = ffb_len_in(&msbc.dec_data);
+				buffer = msbc_dec.data.tail;
+				buffer_len = ffb_len_in(&msbc_dec.data);
 				break;
 #endif
 			}
@@ -400,7 +404,7 @@ retry_sco_read:
 					break;
 #if ENABLE_MSBC
 				case HFP_CODEC_MSBC:
-					ffb_seek(&msbc.dec_data, len);
+					ffb_seek(&msbc_dec.data, len);
 					break;
 #endif
 				}
@@ -426,7 +430,7 @@ retry_sco_read:
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				buffer = msbc.enc_data.data;
+				buffer = msbc_enc.data.data;
 				buffer_len = t->mtu_write;
 				break;
 #endif
@@ -455,7 +459,7 @@ retry_sco_write:
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				ffb_shift(&msbc.enc_data, len);
+				ffb_shift(&msbc_enc.data, len);
 				break;
 #endif
 			}
@@ -476,8 +480,8 @@ retry_sco_write:
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				buffer = msbc.enc_pcm.tail;
-				samples = ffb_len_in(&msbc.enc_pcm);
+				buffer = msbc_enc.pcm.tail;
+				samples = ffb_len_in(&msbc_enc.pcm);
 				break;
 #endif
 			}
@@ -486,7 +490,7 @@ retry_sco_write:
 				if (samples == -1 && errno != EAGAIN)
 					error("PCM read error: %s", strerror(errno));
 				if (samples == 0)
-					ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
+					ba_transport_thread_send_signal(th, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
 				continue;
 			}
 
@@ -497,7 +501,7 @@ retry_sco_write:
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				ffb_seek(&msbc.enc_pcm, samples);
+				ffb_seek(&msbc_enc.pcm, samples);
 				break;
 #endif
 			}
@@ -506,7 +510,7 @@ retry_sco_write:
 		else if (pfds[3].revents & (POLLERR | POLLHUP)) {
 			debug("PCM poll error status: %#x", pfds[3].revents);
 			ba_transport_pcm_release(&t->sco.spk_pcm);
-			ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
+			ba_transport_thread_send_signal(th, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
 		}
 
 		if (pfds[4].revents & POLLOUT) {
@@ -523,8 +527,8 @@ retry_sco_write:
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				buffer = msbc.dec_pcm.data;
-				samples = ffb_len_out(&msbc.dec_pcm);
+				buffer = msbc_dec.pcm.data;
+				samples = ffb_len_out(&msbc_dec.pcm);
 				break;
 #endif
 			}
@@ -533,7 +537,7 @@ retry_sco_write:
 				if (samples == -1)
 					error("FIFO write error: %s", strerror(errno));
 				if (samples == 0)
-					ba_transport_send_signal(t, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
+					ba_transport_thread_send_signal(th, BA_TRANSPORT_SIGNAL_PCM_CLOSE);
 			}
 
 			switch (codec) {
@@ -543,7 +547,7 @@ retry_sco_write:
 				break;
 #if ENABLE_MSBC
 			case HFP_CODEC_MSBC:
-				ffb_shift(&msbc.dec_pcm, samples);
+				ffb_shift(&msbc_dec.pcm, samples);
 				break;
 #endif
 			}
@@ -558,9 +562,9 @@ retry_sco_write:
 			break;
 #if ENABLE_MSBC
 		case HFP_CODEC_MSBC:
-			if (msbc.enc_frames > 0) {
-				asrsync_sync(&asrs, msbc.enc_frames * MSBC_CODESAMPLES);
-				msbc.enc_frames = 0;
+			if (msbc_enc.frames > 0) {
+				asrsync_sync(&asrs, msbc_enc.frames * MSBC_CODESAMPLES);
+				msbc_enc.frames = 0;
 			}
 #endif
 		}
@@ -572,9 +576,11 @@ retry_sco_write:
 	}
 
 fail:
+	debug_transport_thread_loop(th, "EXIT");
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 fail_ffb:
 #if ENABLE_MSBC
+	pthread_cleanup_pop(1);
 	pthread_cleanup_pop(1);
 #endif
 	pthread_cleanup_pop(1);

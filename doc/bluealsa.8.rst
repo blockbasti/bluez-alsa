@@ -128,11 +128,17 @@ OPTIONS
     - **1** - standard quality (44.1 kHz: 606 kbps, 48 kHz: 660 kbps) (**default**)
     - **2** - mobile quality (44.1 kHz: 303 kbps, 48 kHz: 330 kbps)
 
+--xapl-resp-name=NAME
+    Set the product name send in the XAPL response message.
+    By default, the name is set as "BlueALSA".
+    However, some devices (reported with e.g.: Sony WM-1000XM4) will not provide
+    battery level notification unless the product name is set as "iPhone".
+
 PROFILES
 ========
 
 BlueALSA provides support for Bluetooth Advanced Audio Distribution Profile (A2DP),
-Hands-Free Profile (HFP) and Headset Profile (HFP).
+Hands-Free Profile (HFP) and Headset Profile (HSP).
 A2DP profile is dedicated for streaming music (i.e. stereo, 48 kHz or more sampling
 frequency), while HFP and HSP for two-way voice transmission (mono, 8 kHz or 16 kHz
 sampling frequency).
@@ -163,7 +169,7 @@ FILES
 EXAMPLE
 =======
 
-Emulate Bluetooth headset with A2DP and HFP support:
+Emulate Bluetooth headset with A2DP and HSP support:
 
 ::
 
