@@ -82,6 +82,20 @@ static const GDBusSignalInfo *bluealsa_iface_manager_signals[] = {
 	NULL,
 };
 
+static const GDBusPropertyInfo bluealsa_iface_manager_Version = {
+	-1, "Version", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
+static const GDBusPropertyInfo bluealsa_iface_manager_Adapters = {
+	-1, "Adapters", "as", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
+static const GDBusPropertyInfo *bluealsa_iface_manager_properties[] = {
+	&bluealsa_iface_manager_Version,
+	&bluealsa_iface_manager_Adapters,
+	NULL,
+};
+
 static const GDBusArgInfo *pcm_Open_out[] = {
 	&arg_fd,
 	&arg_fd,
@@ -131,6 +145,10 @@ static const GDBusPropertyInfo bluealsa_iface_pcm_Device = {
 	-1, "Device", "o", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
 
+static const GDBusPropertyInfo bluealsa_iface_pcm_Sequence = {
+	-1, "Sequence", "u", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
+};
+
 static const GDBusPropertyInfo bluealsa_iface_pcm_Transport = {
 	-1, "Transport", "s", G_DBUS_PROPERTY_INFO_FLAGS_READABLE, NULL
 };
@@ -175,6 +193,7 @@ static const GDBusPropertyInfo bluealsa_iface_pcm_Volume = {
 
 static const GDBusPropertyInfo *bluealsa_iface_pcm_properties[] = {
 	&bluealsa_iface_pcm_Device,
+	&bluealsa_iface_pcm_Sequence,
 	&bluealsa_iface_pcm_Transport,
 	&bluealsa_iface_pcm_Mode,
 	&bluealsa_iface_pcm_Format,
@@ -227,7 +246,7 @@ const GDBusInterfaceInfo bluealsa_iface_manager = {
 	-1, BLUEALSA_IFACE_MANAGER,
 	(GDBusMethodInfo **)bluealsa_iface_manager_methods,
 	(GDBusSignalInfo **)bluealsa_iface_manager_signals,
-	NULL,
+	(GDBusPropertyInfo **)bluealsa_iface_manager_properties,
 	NULL,
 };
 

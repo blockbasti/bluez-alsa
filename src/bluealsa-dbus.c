@@ -38,8 +38,35 @@
 #include "shared/defs.h"
 #include "shared/log.h"
 
+static GVariant *ba_variant_new_bluealsa_version(void) {
+	return g_variant_new_string(PACKAGE_VERSION);
+}
+
+static GVariant *ba_variant_new_bluealsa_adapters(void) {
+
+	const char *strv[HCI_MAX_DEV] = { NULL };
+	GVariant *variant;
+	size_t i, ii = 0;
+
+	pthread_mutex_lock(&config.adapters_mutex);
+
+	for (i = 0; i < HCI_MAX_DEV; i++)
+		if (config.adapters[i] != NULL)
+			strv[ii++] = config.adapters[i]->hci.name;
+
+	variant = g_variant_new_strv(strv, ii);
+
+	pthread_mutex_unlock(&config.adapters_mutex);
+
+	return variant;
+}
+
 static GVariant *ba_variant_new_device_path(const struct ba_device *d) {
 	return g_variant_new_object_path(d->bluez_dbus_path);
+}
+
+static GVariant *ba_variant_new_device_sequence(const struct ba_device *d) {
+	return g_variant_new_uint32(d->seq);
 }
 
 static GVariant *ba_variant_new_device_battery(const struct ba_device *d) {
@@ -120,6 +147,7 @@ static GVariant *ba_variant_new_pcm_volume(const struct ba_transport_pcm *pcm) {
 static void ba_variant_populate_pcm(GVariantBuilder *props, const struct ba_transport_pcm *pcm) {
 	g_variant_builder_init(props, G_VARIANT_TYPE("a{sv}"));
 	g_variant_builder_add(props, "{sv}", "Device", ba_variant_new_device_path(pcm->t->d));
+	g_variant_builder_add(props, "{sv}", "Sequence", ba_variant_new_device_sequence(pcm->t->d));
 	g_variant_builder_add(props, "{sv}", "Transport", ba_variant_new_transport_type(pcm->t));
 	g_variant_builder_add(props, "{sv}", "Mode", ba_variant_new_pcm_mode(pcm));
 	g_variant_builder_add(props, "{sv}", "Format", ba_variant_new_pcm_format(pcm));
@@ -276,11 +304,34 @@ static void bluealsa_manager_method_call(GDBusConnection *conn, const char *send
 
 }
 
+static GVariant *bluealsa_manager_get_property(GDBusConnection *conn,
+		const char *sender, const char *path, const char *interface,
+		const char *property, GError **error, void *userdata) {
+	(void)conn;
+	(void)sender;
+	(void)path;
+	(void)interface;
+	(void)userdata;
+
+	if (strcmp(property, "Version") == 0)
+		return ba_variant_new_bluealsa_version();
+	if (strcmp(property, "Adapters") == 0)
+		return ba_variant_new_bluealsa_adapters();
+
+	*error = g_error_new(G_DBUS_ERROR, G_DBUS_ERROR_NOT_SUPPORTED,
+			"Property not supported '%s'", property);
+	return NULL;
+}
+
 /**
  * Register BlueALSA D-Bus manager interface. */
 unsigned int bluealsa_dbus_manager_register(GError **error) {
+
 	static const GDBusInterfaceVTable vtable = {
-		.method_call = bluealsa_manager_method_call };
+		.method_call = bluealsa_manager_method_call,
+		.get_property = bluealsa_manager_get_property,
+	};
+
 	return g_dbus_connection_register_object(config.dbus, "/org/bluealsa",
 			(GDBusInterfaceInfo *)&bluealsa_iface_manager, &vtable, NULL, NULL, error);
 }
@@ -397,6 +448,9 @@ static void bluealsa_pcm_open(GDBusMethodInvocation *inv) {
 
 	/* get correct PIPE endpoint - PIPE is unidirectional */
 	pcm->fd = pcm_fds[is_sink ? 0 : 1];
+
+	/* set newly opened PCM as active */
+	pcm->active = true;
 
 	GIOChannel *ch = g_io_channel_unix_new(pcm_fds[2]);
 	g_io_add_watch_full(ch, G_PRIORITY_DEFAULT, G_IO_IN,
@@ -689,6 +743,8 @@ static GVariant *bluealsa_pcm_get_property(GDBusConnection *conn,
 
 	if (strcmp(property, "Device") == 0)
 		return ba_variant_new_device_path(d);
+	if (strcmp(property, "Sequence") == 0)
+		return ba_variant_new_device_sequence(d);
 	if (strcmp(property, "Transport") == 0)
 		return ba_variant_new_transport_type(pcm->t);
 	if (strcmp(property, "Mode") == 0)

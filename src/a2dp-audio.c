@@ -13,8 +13,6 @@
 #include <ctype.h>
 #include <endian.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -25,7 +23,8 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 
-#include <sbc/sbc.h>
+#include <glib.h>
+
 #if ENABLE_AAC
 # include <fdk-aac/aacdecoder_lib.h>
 # include <fdk-aac/aacenc_lib.h>
@@ -35,23 +34,24 @@
 #if ENABLE_MP3LAME
 # include <lame/lame.h>
 #endif
-#if ENABLE_MPG123
-# include <mpg123.h>
-#endif
 #if ENABLE_LDAC
 # include <ldacBT.h>
 # include <ldacBT_abr.h>
 #endif
+#if ENABLE_MPG123
+# include <mpg123.h>
+#endif
+#include <sbc/sbc.h>
 
 #include "a2dp.h"
 #include "a2dp-codecs.h"
 #include "a2dp-rtp.h"
-#include "audio.h"
 #include "bluealsa.h"
 #if ENABLE_APTX || ENABLE_APTX_HD
 # include "codec-aptx.h"
 #endif
 #include "codec-sbc.h"
+#include "io.h"
 #include "utils.h"
 #include "shared/defs.h"
 #include "shared/ffb.h"
@@ -72,168 +72,15 @@ struct io_thread_data {
 	uint16_t rtp_seq_number;
 	/* determine whether transport is locked */
 	bool t_locked;
-	/* determine whether audio is paused */
-	bool t_paused;
 };
-
-/**
- * Scale PCM signal according to the volume configuration. */
-static void ba_transport_pcm_scale(
-		const struct ba_transport_pcm *pcm,
-		void *buffer,
-		size_t samples) {
-
-	size_t frames = samples / pcm->channels;
-
-	if (!pcm->soft_volume) {
-		/* In case of hardware volume control we will perform mute operation,
-		 * because hardware muting is an equivalent of gain=0 which with some
-		 * headsets does not entirely silence audio. */
-		switch (pcm->format) {
-		case BA_TRANSPORT_PCM_FORMAT_S16_2LE:
-			audio_silence_s16_2le(buffer, pcm->channels, frames,
-					pcm->volume[0].muted, pcm->volume[1].muted);
-			break;
-		case BA_TRANSPORT_PCM_FORMAT_S24_4LE:
-		case BA_TRANSPORT_PCM_FORMAT_S32_4LE:
-			audio_silence_s32_4le(buffer, pcm->channels, frames,
-					pcm->volume[0].muted, pcm->volume[1].muted);
-			break;
-		default:
-			g_assert_not_reached();
-		}
-		return;
-	}
-
-	double ch1_scale = 0;
-	double ch2_scale = 0;
-
-	/* scaling based on the decibel formula pow(10, dB / 20) */
-	if (!pcm->volume[0].muted)
-		ch1_scale = pow(10, (0.01 * pcm->volume[0].level) / 20);
-	if (!pcm->volume[1].muted)
-		ch2_scale = pow(10, (0.01 * pcm->volume[1].level) / 20);
-
-	switch (pcm->format) {
-	case BA_TRANSPORT_PCM_FORMAT_S16_2LE:
-		audio_scale_s16_2le(buffer, pcm->channels, frames, ch1_scale, ch2_scale);
-		break;
-	case BA_TRANSPORT_PCM_FORMAT_S24_4LE:
-	case BA_TRANSPORT_PCM_FORMAT_S32_4LE:
-		audio_scale_s32_4le(buffer, pcm->channels, frames, ch1_scale, ch2_scale);
-		break;
-	default:
-		g_assert_not_reached();
-	}
-
-}
-
-/**
- * Flush read buffer of the transport PCM FIFO. */
-ssize_t ba_transport_pcm_flush(struct ba_transport_pcm *pcm) {
-	ssize_t rv = splice(pcm->fd, NULL, config.null_fd, NULL, 1024 * 32, SPLICE_F_NONBLOCK);
-	if (rv > 0)
-		rv /= BA_TRANSPORT_PCM_FORMAT_BYTES(pcm->format);
-	else if (rv == -1 && errno == EAGAIN)
-		rv = 0;
-	return rv;
-}
-
-/**
- * Read PCM signal from the transport PCM FIFO. */
-ssize_t ba_transport_pcm_read(
-		struct ba_transport_pcm *pcm,
-		void *buffer,
-		size_t samples) {
-
-	const size_t sample_size = BA_TRANSPORT_PCM_FORMAT_BYTES(pcm->format);
-	ssize_t ret;
-
-	/* If the passed file descriptor is invalid (e.g. -1) is means, that other
-	 * thread (the controller) has closed the connection. If the connection was
-	 * closed during this call, we will still read correct data, because Linux
-	 * kernel does not decrement file descriptor reference counter until the
-	 * read returns. */
-	while ((ret = read(pcm->fd, buffer, samples * sample_size)) == -1 &&
-			errno == EINTR)
-		continue;
-
-	if (ret > 0) {
-		samples = ret / sample_size;
-		ba_transport_pcm_scale(pcm, buffer, samples);
-		return samples;
-	}
-
-	if (ret == 0)
-		debug("PCM has been closed: %d", pcm->fd);
-	if (errno == EBADF)
-		ret = 0;
-	if (ret == 0)
-		ba_transport_pcm_release(pcm);
-
-	return ret;
-}
-
-/**
- * Write PCM signal to the transport PCM FIFO.
- *
- * Note:
- * This function temporally re-enables thread cancellation! */
-ssize_t ba_transport_pcm_write(
-		struct ba_transport_pcm *pcm,
-		void *buffer,
-		size_t samples) {
-
-	const uint8_t *head = buffer;
-	size_t len = samples * BA_TRANSPORT_PCM_FORMAT_BYTES(pcm->format);
-	struct pollfd pfd = { pcm->fd, POLLOUT, 0 };
-	int oldstate;
-	ssize_t ret;
-
-	/* Scale volume or mute audio signal. */
-	ba_transport_pcm_scale(pcm, buffer, samples);
-
-	/* In order to provide a way of escaping from the infinite poll() we have
-	 * to temporally re-enable thread cancellation. */
-	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &oldstate);
-
-	do {
-		if ((ret = write(pcm->fd, head, len)) == -1)
-			switch (errno) {
-			case EINTR:
-				continue;
-			case EAGAIN:
-				poll(&pfd, 1, -1);
-				continue;
-			case EPIPE:
-				/* This errno value will be received only, when the SIGPIPE
-				 * signal is caught, blocked or ignored. */
-				debug("PCM has been closed: %d", pcm->fd);
-				ba_transport_pcm_release(pcm);
-				ret = 0;
-				/* fall-through */
-			default:
-				goto final;
-			}
-		head += ret;
-		len -= ret;
-	} while (len != 0);
-
-	/* It is guaranteed, that this function will write data atomically. */
-	ret = samples;
-
-final:
-	pthread_setcancelstate(oldstate, NULL);
-	return ret;
-}
 
 /**
  * Poll and read PCM signal from the transport PCM FIFO.
  *
  * Note:
  * This function temporally re-enables thread cancellation! */
-static ssize_t a2dp_poll_and_read_pcm(struct ba_transport_pcm *pcm,
-		struct io_thread_data *io, ffb_t *buffer) {
+static ssize_t a2dp_poll_and_read_pcm(struct io_thread_data *io,
+		struct ba_transport_pcm *pcm, ffb_t *buffer) {
 
 	struct ba_transport_thread *th = io->th;
 	struct pollfd fds[2] = {
@@ -245,8 +92,8 @@ static ssize_t a2dp_poll_and_read_pcm(struct ba_transport_pcm *pcm,
 
 repoll:
 
-	/* Add PCM socket to the poll if transport is active. */
-	fds[1].fd = io->t_paused ? -1 : pcm->fd;
+	/* Add PCM socket to the poll if it is active. */
+	fds[1].fd = pcm->active ? pcm->fd : -1;
 
 	/* Poll for reading with keep-alive and sync timeout. */
 	switch (poll(fds, ARRAYSIZE(fds), io->timeout)) {
@@ -270,21 +117,17 @@ repoll:
 		switch (ba_transport_thread_recv_signal(th)) {
 		case BA_TRANSPORT_SIGNAL_PCM_OPEN:
 		case BA_TRANSPORT_SIGNAL_PCM_RESUME:
-			io->t_paused = false;
 			io->asrs.frames = 0;
 			io->timeout = -1;
 			goto repoll;
 		case BA_TRANSPORT_SIGNAL_PCM_CLOSE:
 			/* reuse PCM read disconnection logic */
 			break;
-		case BA_TRANSPORT_SIGNAL_PCM_PAUSE:
-			io->t_paused = true;
-			goto repoll;
 		case BA_TRANSPORT_SIGNAL_PCM_SYNC:
 			io->timeout = 100;
 			goto repoll;
 		case BA_TRANSPORT_SIGNAL_PCM_DROP:
-			ba_transport_pcm_flush(pcm);
+			io_pcm_flush(pcm);
 			goto repoll;
 		default:
 			goto repoll;
@@ -292,7 +135,7 @@ repoll:
 	}
 
 	ssize_t samples;
-	switch (samples = ba_transport_pcm_read(pcm, buffer->tail, ffb_len_in(buffer))) {
+	switch (samples = io_pcm_read(pcm, buffer->tail, ffb_len_in(buffer))) {
 	case 0:
 		io->timeout = config.a2dp.keep_alive * 1000;
 		debug("Keep-alive polling: %d", io->timeout);
@@ -345,7 +188,8 @@ static int a2dp_validate_bt_sink(struct ba_transport *t) {
  *
  * Note:
  * This function temporally re-enables thread cancellation! */
-static ssize_t a2dp_poll_and_read_bt(struct io_thread_data *io, ffb_t *buffer) {
+static ssize_t a2dp_poll_and_read_bt(struct io_thread_data *io,
+		struct ba_transport_pcm *pcm, ffb_t *buffer) {
 
 	struct ba_transport *t = io->th->t;
 	struct ba_transport_thread *th = io->th;
@@ -358,8 +202,8 @@ static ssize_t a2dp_poll_and_read_bt(struct io_thread_data *io, ffb_t *buffer) {
 
 repoll:
 
-	/* Add BT socket to the poll if transport is active. */
-	fds[1].fd = io->t_paused ? -1 : t->bt_fd;
+	/* Add BT socket to the poll if PCM is active. */
+	fds[1].fd = pcm->active ? t->bt_fd : -1;
 
 	if (poll(fds, ARRAYSIZE(fds), -1) == -1) {
 		if (errno == EINTR)
@@ -371,12 +215,8 @@ repoll:
 	if (fds[0].revents & POLLIN) {
 		/* dispatch incoming event */
 		switch (ba_transport_thread_recv_signal(th)) {
-		case BA_TRANSPORT_SIGNAL_PCM_OPEN:
-		case BA_TRANSPORT_SIGNAL_PCM_RESUME:
-			io->t_paused = false;
-			goto repoll;
-		case BA_TRANSPORT_SIGNAL_PCM_PAUSE:
-			io->t_paused = true;
+		case BA_TRANSPORT_SIGNAL_PCM_CLOSE:
+			io->rtp_seq_number = -1;
 			goto repoll;
 		default:
 			goto repoll;
@@ -554,16 +394,14 @@ static void *a2dp_sink_sbc(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
-		if (t->a2dp.pcm.fd == -1) {
-			io.rtp_seq_number = -1;
+		if (t->a2dp.pcm.fd == -1)
 			continue;
-		}
 
 		const rtp_media_header_t *rtp_media_header;
 		if ((rtp_media_header = a2dp_validate_rtp(bt.data, &io)) == NULL)
@@ -596,7 +434,8 @@ static void *a2dp_sink_sbc(struct ba_transport_thread *th) {
 			rtp_payload_len -= len;
 
 			const size_t samples = decoded / sizeof(int16_t);
-			if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
+			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 				error("FIFO write error: %s", strerror(errno));
 
 		}
@@ -684,7 +523,7 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
-		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
+		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
 			if (samples == -1)
 				error("PCM poll and read error: %s", strerror(errno));
 			goto fail;
@@ -694,7 +533,7 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 		bt.tail = rtp_payload;
 
 		const int16_t *input = pcm.data;
-		size_t input_len = samples;
+		size_t input_samples = samples;
 		size_t output_len = ffb_len_in(&bt);
 		size_t pcm_frames = 0;
 		size_t sbc_frames = 0;
@@ -702,14 +541,14 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 		/* Generate as many SBC frames as possible, but less than a 4-bit media
 		 * header frame counter can contain. The size of the output buffer is
 		 * based on the socket MTU, so such transfer should be most efficient. */
-		while (input_len >= sbc_pcm_samples &&
+		while (input_samples >= sbc_pcm_samples &&
 				output_len >= sbc_frame_len &&
 				sbc_frames < ((1 << 4) - 1)) {
 
 			ssize_t len;
 			ssize_t encoded;
 
-			if ((len = sbc_encode(&sbc, input, input_len * sizeof(int16_t),
+			if ((len = sbc_encode(&sbc, input, input_samples * sizeof(int16_t),
 							bt.tail, output_len, &encoded)) < 0) {
 				error("SBC encoding error: %s", strerror(-len));
 				break;
@@ -717,7 +556,7 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 
 			len = len / sizeof(int16_t);
 			input += len;
-			input_len -= len;
+			input_samples -= len;
 			ffb_seek(&bt, encoded);
 			output_len -= encoded;
 			pcm_frames += len / channels;
@@ -746,7 +585,7 @@ static void *a2dp_source_sbc(struct ba_transport_thread *th) {
 		 * have to append new data to the existing one. Since we do not use
 		 * ring buffer, we will simply move unprocessed data to the front
 		 * of our linear buffer. */
-		ffb_shift(&pcm, samples - input_len);
+		ffb_shift(&pcm, samples - input_samples);
 
 	}
 
@@ -792,6 +631,21 @@ static void *a2dp_sink_mpeg(struct ba_transport_thread *th) {
 
 	pthread_cleanup_push(PTHREAD_CLEANUP(mpg123_delete), handle);
 
+	const unsigned int channels = t->a2dp.pcm.channels;
+	const unsigned int samplerate = t->a2dp.pcm.sampling;
+
+	mpg123_param(handle, MPG123_RESYNC_LIMIT, -1, 0);
+	mpg123_param(handle, MPG123_ADD_FLAGS, MPG123_QUIET, 0);
+#if MPG123_API_VERSION >= 45
+	mpg123_param(handle, MPG123_ADD_FLAGS, MPG123_NO_READAHEAD, 0);
+#endif
+
+	mpg123_format_none(handle);
+	if (mpg123_format(handle, samplerate, channels, MPG123_ENC_SIGNED_16) != MPG123_OK) {
+		error("Couldn't set MPG123 format: %s", mpg123_strerror(handle));
+		goto fail_open;
+	}
+
 	if (mpg123_open_feed(handle) != MPG123_OK) {
 		error("Couldn't open MPG123 feed: %s", mpg123_strerror(handle));
 		goto fail_open;
@@ -835,16 +689,14 @@ static void *a2dp_sink_mpeg(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
-		if (t->a2dp.pcm.fd == -1) {
-			io.rtp_seq_number = -1;
+		if (t->a2dp.pcm.fd == -1)
 			continue;
-		}
 
 		const rtp_mpeg_audio_header_t *rtp_mpeg_header;
 		if ((rtp_mpeg_header = a2dp_validate_rtp(bt.data, &io)) == NULL)
@@ -876,7 +728,8 @@ decode:
 		}
 
 		const size_t samples = len / sizeof(int16_t);
-		if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
+		io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+		if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 			error("FIFO write error: %s", strerror(errno));
 
 		if (len > 0) {
@@ -896,7 +749,8 @@ decode:
 		}
 
 		if (channels == 1) {
-			if (ba_transport_pcm_write(&t->a2dp.pcm, pcm_l, samples) == -1)
+			io_pcm_scale(&t->a2dp.pcm, pcm_l, samples);
+			if (io_pcm_write(&t->a2dp.pcm, pcm_l, samples) == -1)
 				error("FIFO write error: %s", strerror(errno));
 		}
 		else {
@@ -907,7 +761,8 @@ decode:
 				((int16_t *)pcm.data)[i * 2 + 1] = pcm_r[i];
 			}
 
-			if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
+			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 				error("FIFO write error: %s", strerror(errno));
 
 		}
@@ -1057,7 +912,7 @@ static void *a2dp_source_mp3(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
-		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
+		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
 			if (samples == -1)
 				error("PCM poll and read error: %s", strerror(errno));
 			goto fail;
@@ -1213,16 +1068,14 @@ static void *a2dp_sink_aac(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
-		if (t->a2dp.pcm.fd == -1) {
-			io.rtp_seq_number = -1;
+		if (t->a2dp.pcm.fd == -1)
 			continue;
-		}
 
 		const uint8_t *rtp_latm;
 		if ((rtp_latm = a2dp_validate_rtp(bt.data, &io)) == NULL)
@@ -1270,7 +1123,8 @@ static void *a2dp_sink_aac(struct ba_transport_thread *th) {
 			error("Couldn't get AAC stream info");
 		else {
 			const size_t samples = aacinf->frameSize * aacinf->numChannels;
-			if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
+			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 				error("FIFO write error: %s", strerror(errno));
 		}
 
@@ -1444,7 +1298,7 @@ static void *a2dp_source_aac(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
-		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
+		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
 			if (samples == -1)
 				error("PCM poll and read error: %s", strerror(errno));
 			goto fail;
@@ -1572,7 +1426,7 @@ static void *a2dp_sink_aptx(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
@@ -1601,7 +1455,9 @@ static void *a2dp_sink_aptx(struct ba_transport_thread *th) {
 
 		}
 
-		if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, ffb_len_out(&pcm)) == -1)
+		const size_t samples = ffb_len_out(&pcm);
+		io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+		if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 			error("FIFO write error: %s", strerror(errno));
 
 	}
@@ -1661,7 +1517,7 @@ static void *a2dp_source_aptx(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
-		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
+		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
 			if (samples == -1)
 				error("PCM poll and read error: %s", strerror(errno));
 			goto fail;
@@ -1776,16 +1632,14 @@ static void *a2dp_sink_aptx_hd(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
-		if (t->a2dp.pcm.fd == -1) {
-			io.rtp_seq_number = -1;
+		if (t->a2dp.pcm.fd == -1)
 			continue;
-		}
 
 		const uint8_t *rtp_payload;
 		if ((rtp_payload = a2dp_validate_rtp(bt.data, &io)) == NULL)
@@ -1810,7 +1664,9 @@ static void *a2dp_sink_aptx_hd(struct ba_transport_thread *th) {
 
 		}
 
-		if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, ffb_len_out(&pcm)) == -1)
+		const size_t samples = ffb_len_out(&pcm);
+		io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+		if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 			error("FIFO write error: %s", strerror(errno));
 
 	}
@@ -1878,7 +1734,7 @@ static void *a2dp_source_aptx_hd(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
-		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
+		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
 			if (samples == -1)
 				error("PCM poll and read error: %s", strerror(errno));
 			goto fail;
@@ -2010,16 +1866,14 @@ static void *a2dp_sink_ldac(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;
 		}
 
-		if (t->a2dp.pcm.fd == -1) {
-			io.rtp_seq_number = -1;
+		if (t->a2dp.pcm.fd == -1)
 			continue;
-		}
 
 		const rtp_media_header_t *rtp_media_header;
 		if ((rtp_media_header = a2dp_validate_rtp(bt.data, &io)) == NULL)
@@ -2044,7 +1898,8 @@ static void *a2dp_sink_ldac(struct ba_transport_thread *th) {
 			rtp_payload_len -= used;
 
 			const size_t samples = decoded / sample_size;
-			if (ba_transport_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
+			io_pcm_scale(&t->a2dp.pcm, pcm.data, samples);
+			if (io_pcm_write(&t->a2dp.pcm, pcm.data, samples) == -1)
 				error("FIFO write error: %s", strerror(errno));
 
 		}
@@ -2142,7 +1997,7 @@ static void *a2dp_source_ldac(struct ba_transport_thread *th) {
 	for (ba_transport_thread_ready(th);;) {
 
 		ssize_t samples;
-		if ((samples = a2dp_poll_and_read_pcm(&t->a2dp.pcm, &io, &pcm)) <= 0) {
+		if ((samples = a2dp_poll_and_read_pcm(&io, &t->a2dp.pcm, &pcm)) <= 0) {
 			if (samples == -1)
 				error("PCM poll and read error: %s", strerror(errno));
 			goto fail;
@@ -2226,6 +2081,7 @@ fail_open_ldac:
 #if DEBUG
 /**
  * Dump incoming BT data to a file. */
+__attribute__ ((unused))
 static void *a2dp_sink_dump(struct ba_transport_thread *th) {
 
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
@@ -2262,7 +2118,7 @@ static void *a2dp_sink_dump(struct ba_transport_thread *th) {
 	debug_transport_thread_loop(th, "START");
 	for (ba_transport_thread_ready(th);;) {
 		ssize_t len;
-		if ((len = a2dp_poll_and_read_bt(&io, &bt)) <= 0) {
+		if ((len = a2dp_poll_and_read_bt(&io, &t->a2dp.pcm, &bt)) <= 0) {
 			if (len == -1)
 				error("BT poll and read error: %s", strerror(errno));
 			goto fail;

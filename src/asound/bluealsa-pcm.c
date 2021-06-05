@@ -209,15 +209,12 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 	 * transfer procedure. */
 	snd_pcm_uframes_t io_hw_ptr = pcm->io_hw_ptr;
 
-	/* The number of frames to complete the current period. */
-	snd_pcm_uframes_t balance = io->period_size;
-
 	debug2("Starting IO loop: %d", pcm->ba_pcm_fd);
 	for (;;) {
 
 		if (pcm->pause_state & BA_PAUSE_STATE_PENDING ||
 				pcm->io_hw_ptr == -1) {
-			debug2("Pausing IO thread: %ld", pcm->io_hw_ptr);
+			debug2("Pausing IO thread");
 
 			pthread_mutex_lock(&pcm->mutex);
 			pcm->pause_state = BA_PAUSE_STATE_PAUSED;
@@ -239,8 +236,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 				goto fail;
 
 			asrsync_init(&asrs, io->rate);
-			io_hw_ptr = io->hw_ptr;
-
+			io_hw_ptr = pcm->io_hw_ptr;
 		}
 
 		if (io->state == SND_PCM_STATE_DISCONNECTED)
@@ -252,24 +248,25 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		snd_pcm_uframes_t avail;
 		if ((avail = snd_pcm_ioplug_hw_avail(io, io_hw_ptr, io->appl_ptr)) == 0) {
 			io_thread_update_delay(pcm, 0);
-			io_hw_ptr = -1;
-			goto sync;
+			pcm->io_hw_ptr = io_hw_ptr = -1;
+			eventfd_write(pcm->event_fd, 1);
+			continue;
 		}
 
-		/* the number of frames to be transferred in this iteration */
-		snd_pcm_uframes_t frames = balance;
 		/* current offset of the head pointer in the IO buffer */
 		snd_pcm_uframes_t offset = io_hw_ptr % io->buffer_size;
 
-		/* Do not try to transfer more frames than are available in the ring
-		 * buffer! */
+		/* Transfer at most 1 period of frames in each iteration ... */
+		snd_pcm_uframes_t frames = io->period_size;
+		/* ... but do not try to transfer more frames than are available in the
+		 * ring buffer! */
 		if (frames > avail)
 			frames = avail;
 
-		/* If the leftover in the buffer is less than a whole period sizes,
-		 * adjust the number of frames which should be transfered. It has
-		 * turned out, that the buffer might contain fractional number of
-		 * periods - it could be an ALSA bug, though, it has to be handled. */
+		/* When used with the rate plugin the buffer might contain a fractional
+		 * number of periods. So if the leftover in the buffer is less than a
+		 * whole period size, adjust the number of frames which should be
+		 * transfered.  */
 		if (io->buffer_size - offset < frames)
 			frames = io->buffer_size - offset;
 
@@ -277,8 +274,7 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 		size_t len = frames * pcm->frame_size;
 		char *head = pcm->io_hw_buffer + offset * pcm->frame_size;
 
-		/* Increment the HW pointer (with boundary wrap) ready for the next
-		 * iteration. */
+		/* Increment the HW pointer (with boundary wrap). */
 		io_hw_ptr += frames;
 		if (io_hw_ptr >= pcm->io_hw_boundary)
 			io_hw_ptr -= pcm->io_hw_boundary;
@@ -327,21 +323,12 @@ static void *io_thread(snd_pcm_ioplug_t *io) {
 
 		}
 
-		/* repeat until period is completed */
-		balance -= frames;
-		if (balance > 0)
-			continue;
-
-sync:
 		/* Make the new HW pointer value visible to the ioplug. */
 		pcm->io_hw_ptr = io_hw_ptr;
 
-		/* Generate poll() event so application is made aware of
-		 * the HW pointer change. */
-		eventfd_write(pcm->event_fd, 1);
-
-		/* Start the next period. */
-		balance = io->period_size;
+		/* Wake application thread if enough space/frames is available. */
+		if (frames + io->buffer_size - avail >= pcm->io_avail_min)
+			eventfd_write(pcm->event_fd, 1);
 	}
 
 fail:
@@ -419,8 +406,19 @@ static int bluealsa_stop(snd_pcm_ioplug_t *io) {
 
 static snd_pcm_sframes_t bluealsa_pointer(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
-	if (pcm->ba_pcm_fd == -1)
+	if (pcm->ba_pcm_fd == -1) {
+		/* The ioplug sets the PCM state to SND_PCM_STATE_XRUN
+		 * when this function returns error, so setting the state
+		 * here has no effect - but we do it anyway in the hope
+		 * that one day ioplug will acknowledge that PCM devices
+		 * can disconnect. So typically when an application attempts
+		 * I/O on a disconnected bluealsa PCM it gets EPIPE with
+		 * state SND_PCM_STATE_XRUN, and only later when it attempts
+		 * to recover with snd_pcm_prepare() does it get ENODEV
+		 * with state SND_PCM_STATE_DISCONNECTED. */
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 		return -ENODEV;
+	}
 #ifndef SND_PCM_IOPLUG_FLAG_BOUNDARY_WA
 	if (pcm->io_hw_ptr != -1)
 		return pcm->io_hw_ptr % io->buffer_size;
@@ -506,8 +504,10 @@ static int bluealsa_prepare(snd_pcm_ioplug_t *io) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
 	/* if PCM FIFO is not opened, report it right away */
-	if (pcm->ba_pcm_fd == -1)
+	if (pcm->ba_pcm_fd == -1) {
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 		return -ENODEV;
+	}
 
 	/* initialize ring buffer */
 	pcm->io_hw_ptr = 0;
@@ -613,7 +613,7 @@ static snd_pcm_sframes_t bluealsa_calculate_delay(snd_pcm_ioplug_t *io) {
 			buffer_delay = snd_pcm_ioplug_hw_avail(io, pcm->delay_hw_ptr, io->appl_ptr);
 
 		/* If the PCM is running, then some frames from the buffer may have been
-		 * consumed. */
+		 * consumed, so we add them before adjusting for time elapsed. */
 		if (pcm->delay_running)
 			delay += buffer_delay;
 
@@ -622,7 +622,8 @@ static snd_pcm_sframes_t bluealsa_calculate_delay(snd_pcm_ioplug_t *io) {
 			delay = 0;
 
 		/* If the PCM is not running, then the frames in the buffer will not have
-		 * been consumed since pcm->delay_ts. */
+		 * been consumed since pcm->delay_ts, so we add them after the time
+		 * elapsed adjustment. */
 		if (!pcm->delay_running)
 			delay += buffer_delay;
 	}
@@ -686,8 +687,10 @@ static void bluealsa_dump(snd_pcm_ioplug_t *io, snd_output_t *out) {
 static int bluealsa_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 	struct bluealsa_pcm *pcm = io->private_data;
 
-	if (pcm->ba_pcm_fd == -1)
+	if (pcm->ba_pcm_fd == -1) {
+		snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 		return -ENODEV;
+	}
 
 	int ret = 0;
 	*delayp = 0;
@@ -706,9 +709,6 @@ static int bluealsa_delay(snd_pcm_ioplug_t *io, snd_pcm_sframes_t *delayp) {
 			break;
 		case SND_PCM_STATE_SUSPENDED:
 			ret = -ESTRPIPE;
-			break;
-		case SND_PCM_STATE_DISCONNECTED:
-			ret = -ENODEV;
 			break;
 		default:
 			break;
@@ -799,14 +799,12 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 			case SND_PCM_STATE_SUSPENDED:
 				*revents |= POLLERR;
 				break;
-			case SND_PCM_STATE_DISCONNECTED:
-				*revents = POLLERR;
-				ret = -ENODEV;
-				break;
 			case SND_PCM_STATE_OPEN:
 				*revents = POLLERR;
 				ret = -EBADF;
 				break;
+			case SND_PCM_STATE_DISCONNECTED:
+				goto fail;
 			default:
 				break;
 		};
@@ -819,6 +817,7 @@ static int bluealsa_poll_revents(snd_pcm_ioplug_t *io, struct pollfd *pfd,
 	return ret;
 
 fail:
+	snd_pcm_ioplug_set_state(io, SND_PCM_STATE_DISCONNECTED);
 	*revents = POLLERR | POLLHUP;
 	return -ENODEV;
 }

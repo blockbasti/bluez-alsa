@@ -55,6 +55,7 @@
 #include "../src/codec-sbc.c"
 #include "../src/dbus.c"
 #include "../src/hci.c"
+#include "../src/io.c"
 #include "../src/sco.c"
 #include "../src/utils.c"
 #include "../src/shared/ffb.c"
@@ -143,7 +144,6 @@ static void *mock_a2dp_sink(struct ba_transport_thread *th) {
 	struct pollfd fds[1] = {{ th->pipe[0], POLLIN, 0 }};
 	struct asrsync asrs = { .frames = 0 };
 	int16_t buffer[1024 * 2];
-	bool io_paused = false;
 	int x = 0;
 
 	debug_transport_thread_loop(th, "START");
@@ -152,7 +152,7 @@ static void *mock_a2dp_sink(struct ba_transport_thread *th) {
 	while (sigusr1_count == 0) {
 
 		int timout = 0;
-		if (t->a2dp.pcm.fd == -1 || io_paused)
+		if (t->a2dp.pcm.fd == -1 || !t->a2dp.pcm.active)
 			timout = -1;
 
 		if (poll(fds, ARRAYSIZE(fds), timout) == 1 &&
@@ -161,11 +161,7 @@ static void *mock_a2dp_sink(struct ba_transport_thread *th) {
 			switch (ba_transport_thread_recv_signal(th)) {
 			case BA_TRANSPORT_SIGNAL_PCM_OPEN:
 			case BA_TRANSPORT_SIGNAL_PCM_RESUME:
-				io_paused = false;
 				asrs.frames = 0;
-				continue;
-			case BA_TRANSPORT_SIGNAL_PCM_PAUSE:
-				io_paused = true;
 				continue;
 			default:
 				continue;
@@ -180,7 +176,8 @@ static void *mock_a2dp_sink(struct ba_transport_thread *th) {
 		const size_t samples = ARRAYSIZE(buffer);
 		x = snd_pcm_sine_s16le(buffer, samples, channels, x, 1.0 / 128);
 
-		if (ba_transport_pcm_write(&t->a2dp.pcm, buffer, samples) == -1)
+		io_pcm_scale(&t->a2dp.pcm, buffer, samples);
+		if (io_pcm_write(&t->a2dp.pcm, buffer, samples) == -1)
 			error("FIFO write error: %s", strerror(errno));
 
 		/* maintain constant speed */
@@ -497,6 +494,7 @@ int main(int argc, char *argv[]) {
 			return EXIT_FAILURE;
 		}
 
+	log_open(argv[0], false, true);
 	assert(bluealsa_config_init() == 0);
 	assert((config.dbus = g_test_dbus_connection_new_sync(NULL)) != NULL);
 

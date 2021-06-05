@@ -75,6 +75,7 @@ static int transport_pcm_init(
 	pcm->th = th;
 	pcm->mode = mode;
 	pcm->fd = -1;
+	pcm->active = true;
 
 	pthread_mutex_init(&pcm->dbus_mtx, NULL);
 	pthread_mutex_init(&pcm->synced_mtx, NULL);
@@ -766,12 +767,14 @@ final:
 }
 
 int ba_transport_pcm_pause(struct ba_transport_pcm *pcm) {
+	pcm->active = false;
 	ba_transport_thread_send_signal(pcm->th, BA_TRANSPORT_SIGNAL_PCM_PAUSE);
 	debug("PCM paused: %d", pcm->fd);
 	return 0;
 }
 
 int ba_transport_pcm_resume(struct ba_transport_pcm *pcm) {
+	pcm->active = true;
 	ba_transport_thread_send_signal(pcm->th, BA_TRANSPORT_SIGNAL_PCM_RESUME);
 	debug("PCM resumed: %d", pcm->fd);
 	return 0;
@@ -1008,7 +1011,7 @@ int ba_transport_pcm_release(struct ba_transport_pcm *pcm) {
 	 * execution. In this release function it is important to perform actions
 	 * atomically. Since close call is a cancellation point, it is required to
 	 * temporally disable cancellation. For a better understanding of what is
-	 * going on, see the ba_transport_pcm_read() function. */
+	 * going on, see the io_pcm_read() function. */
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &oldstate);
 
 	debug("Closing PCM: %d", pcm->fd);
